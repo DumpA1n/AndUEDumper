@@ -1399,6 +1399,264 @@ inline T* GetDefaultObjImpl()
 }
 
 // ============================================================================
+//  SDK CoreUObject_classes.hpp tail — minimal helper block.
+//
+//  AIOCore namespace + UObject::ProcessEvent inline body only. Other
+//  helpers (GetName / IsA / FindObject / ...) live out-of-line in
+//  CoreUObject_functions.cpp (UECore convention; user must compile and
+//  link that .cpp). StaticClassImpl<> / GetDefaultObjImpl<> templates
+//  are provided by embedded UECore Basic.h, not emitted here.
+// ============================================================================
+static void EmitSDKClassesHppHelpersTail(BufferFmt &buf, int processEventIndex)
+{
+    buf.append("\n// === AIO Core: ProcessEvent dispatch ===\n");
+    buf.append("// Other UObject helper bodies (GetName / IsA / FindObject / ...)\n");
+    buf.append("// live in CoreUObject_functions.cpp — link that .cpp into your TU.\n");
+    buf.append("// FName::s_NameResolver and UObject::GObjects.InitManually() must\n");
+    buf.append("// be wired from your bridge once at startup.\n\n");
+    buf.append("#ifndef AIOHeader_CORE_HELPERS_DEFINED\n");
+    buf.append("#define AIOHeader_CORE_HELPERS_DEFINED\n\n");
+
+    buf.append("namespace AIOCore\n{{\n");
+    buf.append("    #ifdef AIOCORE_PROCESS_EVENT_INDEX\n");
+    buf.append("    constexpr int kProcessEventIndex = AIOCORE_PROCESS_EVENT_INDEX;\n");
+    buf.append("    #else\n");
+    buf.append("    constexpr int kProcessEventIndex = {};\n", processEventIndex);
+    buf.append("    #endif\n");
+    buf.append("}}\n\n");
+
+    buf.append("{}", R"AIOPE(inline void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
+{
+    using FN = void(*)(const UObject*, struct UFunction*, void*);
+    auto vtbl = *reinterpret_cast<void* const* const*>(this);
+    reinterpret_cast<FN>(vtbl[AIOCore::kProcessEventIndex])(this, Function, Parms);
+}
+
+)AIOPE");
+
+    buf.append("#endif // AIOHeader_CORE_HELPERS_DEFINED\n");
+}
+
+// ============================================================================
+//  SDK CoreUObject_functions.cpp body — out-of-line UObject helpers.
+//
+//  Mirrors source/UEProber/UECore/CoreUObject_functions.cpp. Everything
+//  here is non-inline so it compiles into the .cpp's TU only. Caller
+//  emits the file's #include + namespace SDK { ... } shell around this.
+// ============================================================================
+static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
+{
+    buf.append("{}", R"AIOIMPL(// Mirrors UECore CoreUObject_functions.cpp — bodies for UObject helpers
+// declared in CoreUObject_classes.hpp.
+
+// ---- Object lookup -------------------------------------------------
+class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
+{
+    if (!GObjects) return nullptr;
+    const int32_t N = GObjects->Num();
+    for (int32_t i = 0; i < N; ++i)
+    {
+        UObject* Object = GObjects->GetByIndex(i);
+        if (!Object || (reinterpret_cast<uintptr_t>(Object) & 0x7) != 0)
+            continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetFullName() == FullName)
+            return Object;
+    }
+    return nullptr;
+}
+
+class UObject* UObject::FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType)
+{
+    if (!GObjects) return nullptr;
+    const int32_t N = GObjects->Num();
+    for (int32_t i = 0; i < N; ++i)
+    {
+        UObject* Object = GObjects->GetByIndex(i);
+        if (!Object) continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetName() == Name)
+            return Object;
+    }
+    return nullptr;
+}
+
+class UClass* UObject::FindClass(const std::string& ClassFullName)
+{
+    return FindObject<UClass>(ClassFullName, EClassCastFlags{0x20}); // ::Class
+}
+
+class UClass* UObject::FindClassFast(const std::string& ClassName)
+{
+    return FindObjectFast<UClass>(ClassName, EClassCastFlags{0x20}); // ::Class
+}
+
+// ---- Name helpers --------------------------------------------------
+std::string UObject::GetName() const
+{
+    return NamePrivate.ToString();
+}
+
+std::string UObject::GetFullName() const
+{
+    if (!ClassPrivate) return "None";
+    std::string Outers;
+    for (UObject* o = OuterPrivate; o; o = o->OuterPrivate)
+        Outers = o->GetName() + "." + Outers;
+    std::string r = ClassPrivate->GetName();
+    r += " ";
+    r += Outers;
+    r += GetName();
+    return r;
+}
+
+// ---- Type queries --------------------------------------------------
+bool UObject::HasTypeFlag(EClassCastFlags TypeFlags) const
+{
+    if (!ClassPrivate) return false;
+    auto bits = static_cast<uint64_t>(TypeFlags);
+    if (bits == 0) return true; // EClassCastFlags::None
+    return (static_cast<uint64_t>(ClassPrivate->CastFlags) & bits) != 0;
+}
+
+bool UObject::IsA(EClassCastFlags TypeFlags) const
+{
+    return HasTypeFlag(TypeFlags);
+}
+
+bool UObject::IsA(class UClass* cmp) const
+{
+    if (!cmp || !ClassPrivate) return false;
+    for (const struct UStruct* s = ClassPrivate; s; s = s->SuperStruct)
+    {
+        if (s == cmp) return true;
+    }
+    return false;
+}
+
+bool UObject::IsDefaultObject() const
+{
+    // EObjectFlags::ClassDefaultObject = 0x10
+    return (ObjectFlags & 0x10u) != 0;
+}
+
+void UObject::TraverseSupers(const std::function<bool(const UObject*)>& Callback) const
+{
+    const struct UStruct* Clss = nullptr;
+    if (HasTypeFlag(EClassCastFlags{0x20})) // EClassCastFlags::Class
+        Clss = static_cast<const struct UStruct*>(static_cast<const UClass*>(static_cast<const UObject*>(this)));
+    else if (ClassPrivate)
+        Clss = ClassPrivate;
+    while (Clss)
+    {
+        if (!Callback(Clss)) break;
+        Clss = Clss->SuperStruct;
+    }
+}
+
+)AIOIMPL");
+}
+
+// ============================================================================
+//  EmitSDKCoreFiles — shared 8-file emit for SDK_A and SDK_B.
+//
+//  Lays down at <prefix>:
+//    Basic.h                         (UECore embed verbatim)
+//    Basic.cpp                       (UECore embed, member names patched)
+//    UnrealContainers.h              (UECore embed verbatim)
+//    CoreUObject_structs.hpp         (enums + ScriptStructs in namespace SDK)
+//    CoreUObject_classes.hpp         (Classes + AIOCore + ProcessEvent inline)
+//    CoreUObject_parameters.hpp      (stub for now)
+//    CoreUObject_functions.cpp       (UObject helper bodies, out-of-line)
+//
+//  Caller is responsible for the SDK.hpp aggregator (they differ between
+//  SDK_A and SDK_B) and any per-package files beyond CoreUObject.
+// ============================================================================
+static void EmitSDKCoreFiles(
+    const std::string& prefix,
+    const UE_UPackage& corePkg,
+    int processEventIndex,
+    std::unordered_map<std::string, BufferFmt>& outBuffersMap)
+{
+    // ---- 1. UECore companions (verbatim embed) -------------------------
+    outBuffersMap[prefix + "Basic.h"].append("{}", kUECoreBasicH);
+    outBuffersMap[prefix + "Basic.cpp"].append("{}", kUECoreBasicCpp);
+    outBuffersMap[prefix + "UnrealContainers.h"].append("{}", kUECoreUnrealContainersH);
+
+    // ---- 2. CoreUObject_structs.hpp ------------------------------------
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_structs.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("#include \"Basic.h\"\n");
+        buf.append("#include \"UnrealContainers.h\"\n\n");
+
+        // DEFINE_UE_CLASS_HELPERS macro — used by every dumped Class via
+        // Phase 1.6b. Macros are global; emitting once here covers both
+        // _structs.hpp and _classes.hpp (which #includes structs.hpp) plus
+        // every non-core Packages/<pkg>.hpp that transitively pulls structs.
+        buf.append("{}", R"AIOMACRO(#ifndef DEFINE_UE_CLASS_HELPERS
+#define DEFINE_UE_CLASS_HELPERS(FullClassName, ClassNameStr) \
+    static struct UClass* StaticClass() { return StaticClassImpl<ClassNameStr>(); } \
+    static struct FullClassName* GetDefaultObj() { return GetDefaultObjImpl<FullClassName>(); }
+#endif
+
+)AIOMACRO");
+
+        buf.append("namespace SDK\n{{\n\n");
+        buf.append("// Package: CoreUObject - Enums({}) + Structs({})\n\n",
+                   corePkg.Enums.size(), corePkg.Structures.size());
+        if (!corePkg.Enums.empty())
+            UE_UPackage::AppendEnumsToBuffer(const_cast<std::vector<UE_UPackage::Enum>&>(corePkg.Enums), &buf);
+        if (!corePkg.Structures.empty())
+            UE_UPackage::AppendStructsToBuffer(const_cast<std::vector<UE_UPackage::Struct>&>(corePkg.Structures), &buf);
+        buf.append("}} // namespace SDK\n");
+    }
+
+    // ---- 3. CoreUObject_classes.hpp ------------------------------------
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_classes.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("#include \"CoreUObject_structs.hpp\"\n\n");
+        buf.append("namespace SDK\n{{\n\n");
+        buf.append("// Package: CoreUObject - Classes({})\n\n", corePkg.Classes.size());
+
+        if (!corePkg.Classes.empty())
+            UE_UPackage::AppendStructsToBuffer(const_cast<std::vector<UE_UPackage::Struct>&>(corePkg.Classes), &buf);
+
+        // AIOCore namespace + ProcessEvent inline body. Other helper bodies
+        // (GetName / IsA / FindObject / ...) are out-of-line in
+        // CoreUObject_functions.cpp (UECore convention).
+        EmitSDKClassesHppHelpersTail(buf, processEventIndex);
+
+        buf.append("\n}} // namespace SDK\n");
+    }
+
+    // ---- 4. CoreUObject_parameters.hpp (stub) --------------------------
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_parameters.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("// CoreUObject ProcessEvent parameter structs.\n");
+        buf.append("// Currently empty; future passes will emit one struct per UFunction.\n\n");
+        buf.append("#include \"CoreUObject_classes.hpp\"\n");
+    }
+
+    // ---- 5. CoreUObject_functions.cpp (UObject helper bodies) ----------
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
+        buf.append("// CoreUObject UObject helper bodies. Mirrors\n");
+        buf.append("// source/UEProber/UECore/CoreUObject_functions.cpp.\n");
+        buf.append("//\n");
+        buf.append("// Compile and link this .cpp into your TU(s). The bodies depend\n");
+        buf.append("// on FName::s_NameResolver and UObject::GObjects being wired\n");
+        buf.append("// from your bridge once at startup.\n\n");
+        buf.append("#include \"Basic.h\"\n");
+        buf.append("#include \"CoreUObject_classes.hpp\"\n");
+        buf.append("#include \"CoreUObject_parameters.hpp\"\n\n");
+        buf.append("namespace SDK\n{{\n\n");
+        EmitSDKFunctionsCppBodies(buf);
+        buf.append("}} // namespace SDK\n");
+    }
+}
+
+// ============================================================================
 //  DumpAIOHeader — single monolithic header containing every dumped type.
 // ============================================================================
 void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
@@ -1494,27 +1752,27 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
 }
 
 // ============================================================================
-//  DumpSDK_PerPackage (Plan A) — UECore-style separation of infra and pkgs.
+//  DumpSDK_PerPackage (Plan A) — full Dumper-7-style output.
 //
 //  Layout:
 //    SDK_A/
-//    ├── Basic.hpp           preamble (FName, TUObjectArray, ...), forward
-//    │                       decls of every dumped type, phantom decls,
-//    │                       StringLiteral / DEFINE_UE_CLASS_HELPERS macro,
-//    │                       StaticClassImpl<>/GetDefaultObjImpl<> fwd.
-//    ├── CoreHelpers.hpp     inline UObject method bodies + StaticClassImpl
-//    │                       definition + AIOCore::kProcessEventIndex.
-//    │                       Pulls Packages/CoreUObject.hpp transitively.
-//    ├── SDK.hpp             aggregator (Basic + every package + CoreHelpers).
+//    ├── Basic.h                         (UECore embed)
+//    ├── Basic.cpp                       (UECore embed, member-name patched)
+//    ├── UnrealContainers.h              (UECore embed)
+//    ├── CoreUObject_classes.hpp         (UECore-style 4-file split for core)
+//    ├── CoreUObject_structs.hpp
+//    ├── CoreUObject_parameters.hpp
+//    ├── CoreUObject_functions.cpp
+//    ├── SDK.hpp                         (aggregator)
 //    └── Packages/
-//        ├── CoreUObject.hpp dumped UObject/UClass/FVector/... etc.
-//        ├── Engine.hpp
-//        └── ...             one .hpp per dumped UE package.
+//        ├── Engine.hpp                  (one .hpp per non-CoreUObject pkg)
+//        ├── GameplayAbilities.hpp
+//        └── ...
 //
-//  Each Packages/<pkg>.hpp is self-contained for its types (#includes
-//  Basic + cross-pkg deps). User can pull just one package, but to call
-//  helpers like Obj->GetName() they need CoreHelpers.hpp too — SDK.hpp
-//  bundles everything in dep order.
+//  CoreUObject is the only pkg that gets the UECore 4-file split (it's the
+//  reflection foundation everything else builds on). Other pkgs stay as a
+//  single self-contained .hpp under Packages/. SDK_B is the same minus the
+//  Packages/ subdirectory.
 // ============================================================================
 void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap)
 {
@@ -1524,49 +1782,44 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         return;
     }
 
+    // Locate CoreUObject — it's the foundation, everything else depends on it.
+    const size_t kNotFound = static_cast<size_t>(-1);
+    size_t coreIdx = kNotFound;
+    for (size_t i = 0; i < _sdkProcessed.size(); ++i)
+    {
+        if (_sdkProcessed[i].PackageName == "CoreUObject")
+        {
+            coreIdx = i;
+            break;
+        }
+    }
+    if (coreIdx == kNotFound)
+    {
+        logsBufferFmt.append("SDK Plan A: CoreUObject package not found in dump, skipping.\n");
+        return;
+    }
+
     const std::string prefix = "SDK_A/";
     const std::string pkgPrefix = prefix + "Packages/";
 
-    // Basic.hpp — preamble + global forward decls + phantom decls
-    {
-        auto &basicBuf = outBuffersMap[prefix + "Basic.hpp"];
-        basicBuf.append("#pragma once\n\n");
-        basicBuf.append("#include <cstdint>\n#include <string>\n#include <functional>\n\n");
-        basicBuf.append("{}\n", kAIOPreamble);
-        basicBuf.append("// === Forward declarations of all dumped types ===\n\n");
-        for (const auto &p : _sdkProcessed)
-        {
-            for (const auto &e : p.Enums)
-                basicBuf.append("enum class {} : {};\n", e.CppNameOnly, e.UnderlyingType);
-        }
-        basicBuf.append("\n");
-        for (const auto &p : _sdkProcessed)
-        {
-            for (const auto &s : p.Structures) basicBuf.append("struct {};\n", s.CppNameOnly);
-            for (const auto &c : p.Classes)    basicBuf.append("struct {};\n", c.CppNameOnly);
-        }
-        basicBuf.append("\n");
-        if (!_sdkPhantomEnums.empty() || !_sdkPhantomStructs.empty())
-        {
-            basicBuf.append("// === Phantom forward declarations ===\n");
-            for (const auto &n : _sdkPhantomEnums)
-                basicBuf.append("enum class {} : uint8_t;\n", n);
-            for (const auto &n : _sdkPhantomStructs)
-                basicBuf.append("struct {};\n", n);
-            basicBuf.append("\n");
-        }
-    }
+    // ---- 1. Root files (UECore companions + CoreUObject 4-file split) -----
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, outBuffersMap);
 
-    // Per-package: Packages/<pkg>.hpp
+    // ---- 2. Per-package: Packages/<pkg>.hpp for every non-CoreUObject pkg ---
+    size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)
     {
+        if (pkgIdx == coreIdx) continue;
         auto &pkg = _sdkProcessed[pkgIdx];
         const std::string fname = pkgPrefix + pkg.PackageName + ".hpp";
         auto &buf = outBuffersMap[fname];
 
         buf.append("#pragma once\n\n");
-        buf.append("#include \"../Basic.hpp\"\n");
+        // CoreUObject_classes.hpp transitively pulls _structs.hpp + Basic.h +
+        // UnrealContainers.h, giving us UObject + every dumped CoreUObject type.
+        buf.append("#include \"../CoreUObject_classes.hpp\"\n");
 
+        // Cross-pkg deps: every other non-core pkg this pkg depends on.
         std::set<std::string> depPkgs;
         auto collect = [&](const UE_UPackage::Struct &s) {
             for (const auto &dep : s.FullDeps)
@@ -1574,6 +1827,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                 auto it = _sdkNameToPkg.find(dep);
                 if (it == _sdkNameToPkg.end()) continue;
                 if (it->second == pkgIdx) continue;
+                if (it->second == coreIdx) continue; // already pulled via CoreUObject_classes
                 depPkgs.insert(_sdkProcessed[it->second].PackageName);
             }
         };
@@ -1583,6 +1837,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
             buf.append("#include \"{}.hpp\"\n", dp);
         buf.append("\n");
 
+        buf.append("namespace SDK\n{{\n\n");
         buf.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
                    pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
 
@@ -1590,65 +1845,39 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &buf);
         if (!pkg.Classes.empty())    UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
 
-        // Helpers block intentionally NOT emitted here anymore — moved to
-        // SDK_A/CoreHelpers.hpp so package files only contain dumped types.
+        buf.append("}} // namespace SDK\n");
+        ++nonCorePkgCount;
     }
 
-    // CoreHelpers.hpp — inline impls of UObject methods + StaticClassImpl<>
-    // / GetDefaultObjImpl<> bodies + AIOCore::kProcessEventIndex.
-    {
-        auto &buf = outBuffersMap[prefix + "CoreHelpers.hpp"];
-        buf.append("#pragma once\n\n");
-        buf.append("// Inline definitions of UObject helpers (ProcessEvent dispatch,\n");
-        buf.append("// GetName, IsA, FindObject, ...) and the StaticClassImpl<> /\n");
-        buf.append("// GetDefaultObjImpl<> templates used by DEFINE_UE_CLASS_HELPERS.\n");
-        buf.append("// Requires the dumped UObject / UClass / UStruct definitions to\n");
-        buf.append("// be in scope — pulled via the explicit CoreUObject include.\n\n");
-        buf.append("#include \"Packages/CoreUObject.hpp\"\n");
-        EmitAIOCoreHelpersBlock(buf, _processEventIndex);
-    }
-
-    // SDK.hpp aggregator
+    // ---- 3. SDK.hpp aggregator -------------------------------------------
     {
         auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
         sdkBuf.append("#pragma once\n\n");
-        sdkBuf.append("// Aggregator: Basic.hpp + every per-package header in topological\n");
-        sdkBuf.append("// order + CoreHelpers.hpp (must come last — needs UObject defined).\n\n");
-        sdkBuf.append("#include \"Basic.hpp\"\n\n");
+        sdkBuf.append("// Aggregator: CoreUObject_classes.hpp + every Packages/*.hpp\n");
+        sdkBuf.append("// in topological order. Link CoreUObject_functions.cpp +\n");
+        sdkBuf.append("// Basic.cpp into your TU(s).\n\n");
+        sdkBuf.append("#include \"CoreUObject_classes.hpp\"\n");
         for (size_t pkgIdx : _sdkPkgOrder)
         {
+            if (pkgIdx == coreIdx) continue;
             const auto &pkg = _sdkProcessed[pkgIdx];
             sdkBuf.append("#include \"Packages/{}.hpp\"\n", pkg.PackageName);
         }
-        sdkBuf.append("\n#include \"CoreHelpers.hpp\"\n");
     }
 
-    logsBufferFmt.append("SDK Plan A: emitted {}Basic.hpp + {}CoreHelpers.hpp + {}SDK.hpp + {}Packages/ ({} files)\n",
-                         prefix, prefix, prefix, prefix, _sdkPkgOrder.size());
+    logsBufferFmt.append("SDK Plan A: emitted UECore companions + CoreUObject (4 files) + {}Packages/ ({} files) + SDK.hpp\n",
+                         prefix, nonCorePkgCount);
     logsBufferFmt.append("==========================\n");
 }
 
 // ============================================================================
-//  DumpSDK_UECoreStyle (Plan B) — UECore-style core-only split.
+//  DumpSDK_UECoreStyle (Plan B) — SDK_A minus the Packages/ subdirectory.
 //
-//  Emits the CoreUObject reflection package as four files plus an SDK.hpp
-//  aggregator, alongside the three UECore companions (Basic.h, Basic.cpp,
-//  UnrealContainers.h) embedded verbatim from source/UEProber/UECore/ so
-//  the resulting SDK_B/ directory is self-contained — 8 files total, no
-//  manual file copying required.
-//
-//  Dumped content lives in `namespace SDK { ... }` to match UECore's
-//  convention; the embedded Basic.h declares its types in the same
-//  namespace, and `using namespace UC;` therein pulls TArray / int32 /
-//  etc into scope without needing per-class qualification.
-//
-//  Helper methods (GetName / IsA / FindObject / ...) come from
-//  EmitAIOCoreHelpersBlock with `emitTemplates=false` — embedded Basic.h
-//  ships its own StaticClassImpl<> / GetDefaultObjImpl<> templates, so
-//  emitting ours would duplicate-define them. The macro
-//  DEFINE_UE_CLASS_HELPERS (used by the dumped Classes via Phase 1.6b)
-//  is emitted once in CoreUObject_structs.hpp's prelude — macros are
-//  global so this is enough for both _structs and _classes to see it.
+//  Emits exactly the 8 root files SDK_A also produces (UECore companions +
+//  CoreUObject 4-file split + SDK.hpp), but skips per-package files for
+//  non-CoreUObject content. Useful when you only want core reflection
+//  primitives (UObject / UClass / FName / FVector / ...) without dragging
+//  in Engine/GameplayAbilities/etc.
 // ============================================================================
 void UEDumper::DumpSDK_UECoreStyle(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap)
 {
@@ -1658,7 +1887,6 @@ void UEDumper::DumpSDK_UECoreStyle(BufferFmt &logsBufferFmt, std::unordered_map<
         return;
     }
 
-    // Plan B targets only the CoreUObject package — locate it.
     const size_t kNotFound = static_cast<size_t>(-1);
     size_t coreIdx = kNotFound;
     for (size_t i = 0; i < _sdkProcessed.size(); ++i)
@@ -1676,93 +1904,21 @@ void UEDumper::DumpSDK_UECoreStyle(BufferFmt &logsBufferFmt, std::unordered_map<
     }
 
     const std::string prefix = "SDK_B/";
-    auto &pkg = _sdkProcessed[coreIdx];
 
-    // ---- 1. UECore companions (verbatim embed) -------------------------
-    // Basic.cpp's references to UObject members were patched in
-    // UECoreEmbed.hpp: Class->Index → ClassPrivate->InternalIndex,
-    // &Class->Name → &Class->NamePrivate, Object->Name → Object->NamePrivate,
-    // Other->Index → Other->InternalIndex. UObject::GObjects is provided
-    // by an injected static member on UObject (see classes.hpp emit below).
-    outBuffersMap[prefix + "Basic.h"].append("{}", kUECoreBasicH);
-    outBuffersMap[prefix + "Basic.cpp"].append("{}", kUECoreBasicCpp);
-    outBuffersMap[prefix + "UnrealContainers.h"].append("{}", kUECoreUnrealContainersH);
+    // 7 of the 8 files (UECore companions + CoreUObject 4-file split).
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, outBuffersMap);
 
-    // ---- 2. CoreUObject_structs.hpp ------------------------------------
-    {
-        auto &buf = outBuffersMap[prefix + "CoreUObject_structs.hpp"];
-        buf.append("#pragma once\n\n");
-        buf.append("#include \"Basic.h\"\n");
-        buf.append("#include \"UnrealContainers.h\"\n\n");
-
-        // DEFINE_UE_CLASS_HELPERS macro — used by every dumped Class via
-        // Phase 1.6b. Macros are global so emitting once here covers
-        // _structs.hpp and _classes.hpp transitively via the include chain.
-        // Routed through "{}" so the macro body's literal { } don't get
-        // interpreted as fmt placeholders.
-        buf.append("{}", R"AIOMACRO(#ifndef DEFINE_UE_CLASS_HELPERS
-#define DEFINE_UE_CLASS_HELPERS(FullClassName, ClassNameStr) \
-    static struct UClass* StaticClass() { return StaticClassImpl<ClassNameStr>(); } \
-    static struct FullClassName* GetDefaultObj() { return GetDefaultObjImpl<FullClassName>(); }
-#endif
-
-)AIOMACRO");
-
-        buf.append("namespace SDK\n{{\n\n");
-        buf.append("// Package: CoreUObject - Enums({}) + Structs({})\n\n",
-                   pkg.Enums.size(), pkg.Structures.size());
-        if (!pkg.Enums.empty())      UE_UPackage::AppendEnumsToBuffer(pkg.Enums, &buf);
-        if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &buf);
-        buf.append("}} // namespace SDK\n");
-    }
-
-    // ---- 3. CoreUObject_classes.hpp ------------------------------------
-    {
-        auto &buf = outBuffersMap[prefix + "CoreUObject_classes.hpp"];
-        buf.append("#pragma once\n\n");
-        buf.append("#include \"CoreUObject_structs.hpp\"\n\n");
-        buf.append("namespace SDK\n{{\n\n");
-        buf.append("// Package: CoreUObject - Classes({})\n\n", pkg.Classes.size());
-
-        if (!pkg.Classes.empty())
-            UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
-
-        // Helper bodies — skip StaticClassImpl/GetDefaultObjImpl templates
-        // (Basic.h provides those, with its own BasicFilesImpleUtils chain).
-        EmitAIOCoreHelpersBlock(buf, _processEventIndex, /*emitTemplates=*/false);
-
-        buf.append("\n}} // namespace SDK\n");
-    }
-
-    // ---- 4. CoreUObject_parameters.hpp (stub) --------------------------
-    {
-        auto &buf = outBuffersMap[prefix + "CoreUObject_parameters.hpp"];
-        buf.append("#pragma once\n\n");
-        buf.append("// CoreUObject ProcessEvent parameter structs.\n");
-        buf.append("// Currently empty; future passes will emit one struct per UFunction.\n\n");
-        buf.append("#include \"CoreUObject_structs.hpp\"\n");
-    }
-
-    // ---- 5. CoreUObject_functions.cpp (stub) ---------------------------
-    {
-        auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
-        buf.append("// CoreUObject function bodies (ProcessEvent dispatch).\n");
-        buf.append("// Currently empty; future passes will emit one body per UFunction\n");
-        buf.append("// using AIOCore::kProcessEventIndex from CoreUObject_classes.hpp.\n\n");
-        buf.append("#include \"CoreUObject_classes.hpp\"\n");
-        buf.append("#include \"CoreUObject_parameters.hpp\"\n");
-    }
-
-    // ---- 6. SDK.hpp (single-include entry) -----------------------------
+    // 8th: SDK.hpp single-include entry.
     {
         auto &buf = outBuffersMap[prefix + "SDK.hpp"];
         buf.append("#pragma once\n\n");
         buf.append("// Single-include entry. Pulls CoreUObject_classes.hpp which\n");
         buf.append("// transitively pulls CoreUObject_structs.hpp -> Basic.h +\n");
-        buf.append("// UnrealContainers.h. Link Basic.cpp into your TU(s).\n\n");
+        buf.append("// UnrealContainers.h. Link Basic.cpp + CoreUObject_functions.cpp\n");
+        buf.append("// into your TU(s).\n\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
     }
 
-    logsBufferFmt.append("SDK Plan B: emitted Basic.h/Basic.cpp/UnrealContainers.h + CoreUObject (4 files) + SDK.hpp under {}\n", prefix);
+    logsBufferFmt.append("SDK Plan B: emitted UECore companions + CoreUObject (4 files) + SDK.hpp under {}\n", prefix);
     logsBufferFmt.append("==========================\n");
 }
