@@ -982,6 +982,18 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                     "\tstatic struct UClass* FindClass(const std::string& ClassFullName);\n"
                     "\tstatic struct UClass* FindClassFast(const std::string& ClassName);\n";
             }
+            else if (s.CppNameOnly == "UClass")
+            {
+                // Lookup helper used by every emitted UFunction body's
+                // ProcessEvent dispatch:
+                //     ClassPrivate->GetFunction("Owner", "FuncName")
+                // Walks SuperStruct + Children, matched by Function-cast flag
+                // (EClassCastFlags{0x80000}) and FName equality. Body emitted
+                // inline in AIOHeader / out-of-line in CoreUObject_functions.cpp.
+                s.ExtraDecls =
+                    "\tstruct UFunction* GetFunction(const std::string& ClassName, "
+                    "const std::string& FuncName) const;\n";
+            }
         };
 
         for (auto &p : _sdkProcessed)
@@ -1704,6 +1716,169 @@ void UObject::TraverseSupers(const std::function<bool(const UObject*)>& Callback
 )AIOIMPL");
 }
 
+// ============================================================================
+//  EmitUClassGetFunctionBody — body for UClass::GetFunction declared by
+//  Phase 1.6 augmenter. Mirrors source/UEProber/UECore/CoreUObject_functions.cpp
+//  (UClass::GetFunction) but uses our member naming (SuperStruct / Children /
+//  Next) instead of UECore's (Super / Children / Next).
+//
+//  EClassCastFlags{0x80000} = ::Function (matches a UField that is a UFunction).
+// ============================================================================
+static void EmitUClassGetFunctionBody(BufferFmt &buf, bool emitInline)
+{
+    const char *kw = emitInline ? "inline " : "";
+    buf.append(
+        "// ---- UClass::GetFunction --------------------------------------------\n"
+        "{}struct UFunction* UClass::GetFunction(const std::string& ClassName, "
+        "const std::string& FuncName) const\n"
+        "{{\n"
+        "    for (const struct UStruct* Clss = this; Clss; Clss = Clss->SuperStruct)\n"
+        "    {{\n"
+        "        if (Clss->GetName() != ClassName) continue;\n"
+        "        for (struct UField* Field = Clss->Children; Field; Field = Field->Next)\n"
+        "        {{\n"
+        "            if (Field->HasTypeFlag(EClassCastFlags{{0x80000}}) "
+        "&& Field->GetName() == FuncName)\n"
+        "                return static_cast<struct UFunction*>(Field);\n"
+        "        }}\n"
+        "    }}\n"
+        "    return nullptr;\n"
+        "}}\n\n", kw);
+}
+
+// ============================================================================
+//  EmitUFunctionBody — emit the C++ body for one dumped UFunction. Body
+//  shape mirrors Dumper-7's per-class functions: a static UFunction* cache,
+//  an anonymous local Parms struct mirroring the UE param layout, fill-in
+//  for in-params, ProcessEvent dispatch, copy-out for out-params, and
+//  return of Parms.ReturnValue when applicable.
+//
+//  - non-static: dispatch via ClassPrivate->GetFunction(...) + this->ProcessEvent.
+//  - static    : dispatch via StaticClass()->GetFunction(...) + GetDefaultObj()->ProcessEvent.
+// ============================================================================
+static void EmitUFunctionBody(BufferFmt &buf,
+                              const UE_UPackage::Function &f,
+                              bool emitInline)
+{
+    const char *kw = emitInline ? "inline " : "";
+
+    // Strip leading "static " from CppName when emitting the out-of-line
+    // definition: `static` is only valid in the class body declaration, not
+    // on the out-of-line definition. Same applies to inline AIOHeader bodies.
+    std::string headOnly = f.CppName;
+    const std::string staticPrefix = "static ";
+    if (headOnly.compare(0, staticPrefix.size(), staticPrefix) == 0)
+        headOnly = headOnly.substr(staticPrefix.size());
+
+    // headOnly is now "<ReturnType> <FuncName>". Inject the qualifier so it
+    // becomes "<ReturnType> <Owner>::<FuncName>".
+    const auto spacePos = headOnly.rfind(' ');
+    if (spacePos == std::string::npos)
+        return; // malformed — skip
+    std::string qualifiedHead = headOnly.substr(0, spacePos + 1)
+                              + f.OwnerCppName + "::"
+                              + headOnly.substr(spacePos + 1);
+
+    const bool hasReturn = (f.ReturnType != "void");
+
+    buf.append("{}{}({})\n{{\n", kw, qualifiedHead, f.Params);
+
+    // Function pointer cache + lookup. Static dispatch resolves through
+    // StaticClass() (cached per type via DEFINE_UE_CLASS_HELPERS); the
+    // instance dispatch reads ClassPrivate, which the Phase 1.6 augmenter
+    // typed as `struct UClass*`.
+    buf.append("    static struct UFunction* Func = nullptr;\n");
+    if (f.IsStatic)
+    {
+        buf.append("    if (!Func) Func = StaticClass()->GetFunction(\"{}\", \"{}\");\n",
+                   f.OwnerUEName, f.Name);
+    }
+    else
+    {
+        buf.append("    if (!Func) Func = ClassPrivate->GetFunction(\"{}\", \"{}\");\n",
+                   f.OwnerUEName, f.Name);
+    }
+
+    // Anonymous local Parms struct mirroring UE's param layout. Field order
+    // matches UE's reflection iteration (the order params were pushed into
+    // ParamsList by GenerateFunction). The trailing ReturnValue (if any) is
+    // emitted last — UE places it at the end of the param block.
+    buf.append("    struct\n    {{\n");
+    for (const auto &p : f.ParamsList)
+    {
+        if (p.ArrayDim > 1)
+            buf.append("        {} {}[0x{:X}];\n", p.Type, p.Name, p.ArrayDim);
+        else
+            buf.append("        {} {};\n", p.Type, p.Name);
+    }
+    if (hasReturn)
+        buf.append("        {} ReturnValue;\n", f.ReturnType);
+    buf.append("    }} Parms{{}};\n");
+
+    // Fill in-params. ConstParm + OutParm degenerates to "const Type&" in
+    // signature but is treated as an in-param at marshalling time. Pure
+    // out-params are *not* filled (callers don't pass anything in).
+    for (const auto &p : f.ParamsList)
+    {
+        const bool isOut       = (p.Flags & CPF_OutParm) != 0;
+        const bool isConstOut  = isOut && (p.Flags & CPF_ConstParm) != 0;
+        const bool fillFromArg = !isOut || isConstOut;
+        if (!fillFromArg) continue;
+
+        if (p.ArrayDim > 1)
+            buf.append("    memcpy(Parms.{}, {}, sizeof({}) * 0x{:X});\n",
+                       p.Name, p.Name, p.Type, p.ArrayDim);
+        else
+            buf.append("    Parms.{} = {};\n", p.Name, p.Name);
+    }
+
+    // Dispatch. Static path goes through GetDefaultObj() — DEFINE_UE_CLASS_HELPERS
+    // emits this static accessor on every dumped class. Non-static path is
+    // a direct member call (ProcessEvent inherited from UObject).
+    if (f.IsStatic)
+        buf.append("    GetDefaultObj()->ProcessEvent(Func, &Parms);\n");
+    else
+        buf.append("    this->ProcessEvent(Func, &Parms);\n");
+
+    // Copy out: pure out-params (without ConstParm) get written back from
+    // Parms into the caller's reference.
+    for (const auto &p : f.ParamsList)
+    {
+        const bool isOut      = (p.Flags & CPF_OutParm) != 0;
+        const bool isConstOut = isOut && (p.Flags & CPF_ConstParm) != 0;
+        if (!isOut || isConstOut) continue;
+
+        if (p.ArrayDim > 1)
+            buf.append("    memcpy({}, Parms.{}, sizeof({}) * 0x{:X});\n",
+                       p.Name, p.Name, p.Type, p.ArrayDim);
+        else
+            buf.append("    {} = Parms.{};\n", p.Name, p.Name);
+    }
+
+    if (hasReturn)
+        buf.append("    return Parms.ReturnValue;\n");
+
+    buf.append("}}\n\n");
+}
+
+// ============================================================================
+//  EmitPackageFunctionBodies — emit ProcessEvent dispatch bodies for every
+//  UFunction across every Class in `pkg`. UScriptStructs are skipped — they
+//  have no associated UFunction children.
+// ============================================================================
+static void EmitPackageFunctionBodies(BufferFmt &buf,
+                                      const UE_UPackage &pkg,
+                                      bool emitInline)
+{
+    for (const auto &c : pkg.Classes)
+    {
+        if (c.Functions.empty()) continue;
+        buf.append("// ---- {}::* ----\n", c.CppNameOnly);
+        for (const auto &f : c.Functions)
+            EmitUFunctionBody(buf, f, emitInline);
+    }
+}
+
 // Substitute the embedded `#define bWITH_CASE_PRESERVING_NAME false` with
 // `... true` when the per-game profile flags case-preserving FName. The
 // switch flips ComparisonIndex/DisplayIndex from a 4-byte union into two
@@ -1721,7 +1896,7 @@ static std::string ApplyCasePreservingDefine(std::string content, bool casePrese
 }
 
 // ============================================================================
-//  EmitSDKCoreFiles — shared 8-file emit for SDK_A and SDK_B.
+//  EmitSDKCoreFiles — shared core-file emit for SDK_A and SDK_B.
 //
 //  Lays down at <prefix>:
 //    Basic.h                         (UECore embed verbatim)
@@ -1729,8 +1904,7 @@ static std::string ApplyCasePreservingDefine(std::string content, bool casePrese
 //    UnrealContainers.h              (UECore embed verbatim)
 //    CoreUObject_structs.hpp         (enums + ScriptStructs in namespace SDK)
 //    CoreUObject_classes.hpp         (Classes + AIOCore + ProcessEvent inline)
-//    CoreUObject_parameters.hpp      (stub for now)
-//    CoreUObject_functions.cpp       (UObject helper bodies, out-of-line)
+//    CoreUObject_functions.cpp       (UObject + UClass helpers + UFunction bodies)
 //
 //  Caller is responsible for the SDK.hpp aggregator (they differ between
 //  SDK_A and SDK_B) and any per-package files beyond CoreUObject.
@@ -1809,29 +1983,23 @@ static void EmitSDKCoreFiles(
         buf.append("\n}} // namespace SDK\n");
     }
 
-    // ---- 4. CoreUObject_parameters.hpp (stub) --------------------------
-    {
-        auto &buf = outBuffersMap[prefix + "CoreUObject_parameters.hpp"];
-        buf.append("#pragma once\n\n");
-        buf.append("// CoreUObject ProcessEvent parameter structs.\n");
-        buf.append("// Currently empty; future passes will emit one struct per UFunction.\n\n");
-        buf.append("#include \"CoreUObject_classes.hpp\"\n");
-    }
-
-    // ---- 5. CoreUObject_functions.cpp (UObject helper bodies) ----------
+    // ---- 4. CoreUObject_functions.cpp (UObject + UClass helpers + bodies) -
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
-        buf.append("// CoreUObject UObject helper bodies. Mirrors\n");
-        buf.append("// source/UEProber/UECore/CoreUObject_functions.cpp.\n");
+        buf.append("// CoreUObject helper bodies. Mirrors\n");
+        buf.append("// source/UEProber/UECore/CoreUObject_functions.cpp plus the\n");
+        buf.append("// ProcessEvent dispatch body for every UFunction in CoreUObject.\n");
         buf.append("//\n");
         buf.append("// Compile and link this .cpp into your TU(s). The bodies depend\n");
         buf.append("// on FName::s_NameResolver and UObject::GObjects being wired\n");
         buf.append("// from your bridge once at startup.\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
-        buf.append("#include \"CoreUObject_parameters.hpp\"\n\n");
+        buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
         buf.append("namespace SDK\n{{\n\n");
         EmitSDKFunctionsCppBodies(buf);
+        EmitUClassGetFunctionBody(buf, /*emitInline=*/false);
+        EmitPackageFunctionBodies(buf, corePkg, /*emitInline=*/false);
         buf.append("}} // namespace SDK\n");
     }
 }
@@ -1922,6 +2090,20 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
     }
 
     EmitAIOCoreHelpersBlock(aioBufferFmt, _processEventIndex);
+
+    // === UFunction ProcessEvent bodies (header-only inline) =============
+    // Order matters: CoreUObject's UClass::GetFunction body comes first
+    // because every other dumped UFunction's body lookup goes through it.
+    // Wrapped in its own include guard so a TU that ends up pulling this
+    // header twice doesn't re-define everything.
+    aioBufferFmt.append("\n#ifndef AIOHeader_FUNCTION_BODIES_DEFINED\n");
+    aioBufferFmt.append("#define AIOHeader_FUNCTION_BODIES_DEFINED\n");
+    aioBufferFmt.append("// memcpy for ArrayDim>1 param marshalling.\n");
+    aioBufferFmt.append("#include <cstring>\n\n");
+    EmitUClassGetFunctionBody(aioBufferFmt, /*emitInline=*/true);
+    for (size_t pkgIdx : _sdkPkgOrder)
+        EmitPackageFunctionBodies(aioBufferFmt, _sdkProcessed[pkgIdx], /*emitInline=*/true);
+    aioBufferFmt.append("#endif // AIOHeader_FUNCTION_BODIES_DEFINED\n");
 
     logsBufferFmt.append("Saved packages: {}\nSaved classes: {}\nSaved structs: {}\nSaved enums: {}\n",
                          packages_saved, classes_saved, structs_saved, enums_saved);
@@ -2036,6 +2218,45 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
 
         buf.append("}} // namespace SDK\n");
         ++nonCorePkgCount;
+
+        // ---- 2b. <pkg>_functions.hpp (header-only inline bodies) -----------
+        // Bodies need *complete* types (Parms.X member access, memcpy with
+        // sizeof). The sibling <pkg>.hpp covers same-package + struct-level
+        // FullDeps; we additionally collect every other non-core pkg whose
+        // type appears in any function signature, since param types may be
+        // forward-decl-only at <pkg>.hpp level.
+        const std::string fnFname = pkgPrefix + pkg.PackageName + "_functions.hpp";
+        auto &fbuf = outBuffersMap[fnFname];
+        fbuf.append("#pragma once\n\n");
+        fbuf.append("#include \"{}.hpp\"\n", pkg.PackageName);
+
+        std::set<std::string> fnDepPkgs;
+        auto collectFnDeps = [&](const UE_UPackage::Struct &s) {
+            for (const auto &f : s.Functions)
+            {
+                std::set<std::string> full, fwd;
+                UE_UPackage::ExtractTypeDeps(f.CppName, full, fwd);
+                UE_UPackage::ExtractTypeDeps(f.Params,  full, fwd);
+                for (const auto &set : { full, fwd })
+                {
+                    for (const auto &dep : set)
+                    {
+                        auto it = _sdkNameToPkg.find(dep);
+                        if (it == _sdkNameToPkg.end()) continue;
+                        if (it->second == pkgIdx) continue;
+                        if (it->second == coreIdx) continue;
+                        fnDepPkgs.insert(_sdkProcessed[it->second].PackageName);
+                    }
+                }
+            }
+        };
+        for (const auto &c : pkg.Classes) collectFnDeps(c);
+        for (const auto &dp : fnDepPkgs)
+            fbuf.append("#include \"{}.hpp\"\n", dp);
+        fbuf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
+        fbuf.append("namespace SDK\n{{\n\n");
+        EmitPackageFunctionBodies(fbuf, pkg, /*emitInline=*/true);
+        fbuf.append("}} // namespace SDK\n");
     }
 
     // ---- 3. SDK.hpp aggregator -------------------------------------------
@@ -2043,7 +2264,8 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
         sdkBuf.append("#pragma once\n\n");
         sdkBuf.append("// Aggregator: CoreUObject_classes.hpp + every Packages/*.hpp\n");
-        sdkBuf.append("// in topological order. Link CoreUObject_functions.cpp +\n");
+        sdkBuf.append("// then every Packages/*_functions.hpp (bodies need every\n");
+        sdkBuf.append("// declaration in scope first). Link CoreUObject_functions.cpp +\n");
         sdkBuf.append("// Basic.cpp into your TU(s).\n\n");
         sdkBuf.append("#include \"CoreUObject_classes.hpp\"\n");
         for (size_t pkgIdx : _sdkPkgOrder)
@@ -2052,9 +2274,16 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
             const auto &pkg = _sdkProcessed[pkgIdx];
             sdkBuf.append("#include \"Packages/{}.hpp\"\n", pkg.PackageName);
         }
+        sdkBuf.append("\n// --- Function bodies (inline, header-only) ---\n");
+        for (size_t pkgIdx : _sdkPkgOrder)
+        {
+            if (pkgIdx == coreIdx) continue;
+            const auto &pkg = _sdkProcessed[pkgIdx];
+            sdkBuf.append("#include \"Packages/{}_functions.hpp\"\n", pkg.PackageName);
+        }
     }
 
-    logsBufferFmt.append("SDK Plan A: emitted UECore companions + CoreUObject (4 files) + {}Packages/ ({} files) + SDK.hpp\n",
+    logsBufferFmt.append("SDK Plan A: emitted UECore companions + CoreUObject core files + {}Packages/ ({} pkgs x 2 files) + SDK.hpp\n",
                          prefix, nonCorePkgCount);
     logsBufferFmt.append("==========================\n");
 }

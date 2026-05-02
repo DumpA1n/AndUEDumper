@@ -82,6 +82,40 @@ static std::string SanitizeIdentifier(const std::string &in)
     return out;
 }
 
+// SanitizeIdentForCpp — used for positions that become C++ identifiers in
+// a body/declaration where they must NOT collide with C++ keywords or with
+// the local variables we generate inside ProcessEvent dispatch bodies
+// (`Parms`, `Func`). Characters are filtered as in SanitizeIdentifier; if
+// the result is a keyword/reserved name, an underscore is appended.
+static std::string SanitizeIdentForCpp(const std::string &in)
+{
+    std::string out = SanitizeIdentifier(in);
+    if (out.empty())
+        return out;
+
+    static const std::unordered_set<std::string> kReserved = {
+        // C++ keywords (covers C++20)
+        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor","bool",
+        "break","case","catch","char","char8_t","char16_t","char32_t","class",
+        "compl","concept","const","consteval","constexpr","constinit","const_cast",
+        "continue","co_await","co_return","co_yield","decltype","default","delete",
+        "do","double","dynamic_cast","else","enum","explicit","export","extern",
+        "false","float","for","friend","goto","if","inline","int","long","mutable",
+        "namespace","new","noexcept","not","not_eq","nullptr","operator","or","or_eq",
+        "private","protected","public","register","reinterpret_cast","requires",
+        "return","short","signed","sizeof","static","static_assert","static_cast",
+        "struct","switch","template","this","thread_local","throw","true","try",
+        "typedef","typeid","typename","union","unsigned","using","virtual","void",
+        "volatile","wchar_t","while","xor","xor_eq",
+        // Locals our emitted ProcessEvent bodies use — keep param names from
+        // shadowing them. UE rarely generates these but BP-named params can.
+        "Parms","Func",
+    };
+    if (kReserved.count(out))
+        out.push_back('_');
+    return out;
+}
+
 // Identifiers that come from primitive C++ types or the AIOHeader preamble
 // (predefined containers, smart pointers, basic UE types). Members of this
 // set never become package-level dependencies.
@@ -187,6 +221,10 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
     out->NumParams = fn.GetNumParams();
     out->ParamSize = fn.GetParamSize();
     out->Func = fn.GetFunc();
+    out->IsStatic = (out->EFlags & FUNC_Static) != 0;
+    out->ReturnType = "void"; // overwritten if a CPF_ReturnParm is found
+
+    const std::string sanitizedFuncName = SanitizeIdentForCpp(fn.GetName());
 
     auto generateParam = [&](IProperty *prop)
     {
@@ -195,22 +233,35 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         // if property has 'ReturnParm' flag
         if (flags & CPF_ReturnParm)
         {
-            out->CppName = SanitizeForCpp(prop->GetType().second) + " " + SanitizeIdentifier(fn.GetName());
+            out->ReturnType = SanitizeForCpp(prop->GetType().second);
         }
         // if property has 'Parm' flag
         else if (flags & CPF_Parm)
         {
             const std::string typeStr = SanitizeForCpp(prop->GetType().second);
-            const std::string nameStr = SanitizeIdentifier(prop->GetName());
-            if (prop->GetArrayDim() > 1)
+            const std::string nameStr = SanitizeIdentForCpp(prop->GetName());
+            const int32_t arrDim = prop->GetArrayDim();
+
+            Param p;
+            p.Type = typeStr;
+            p.Name = nameStr;
+            p.Flags = flags;
+            p.ArrayDim = arrDim;
+            out->ParamsList.push_back(std::move(p));
+
+            if (arrDim > 1)
             {
                 out->Params += fmt::format("{}* {}, ", typeStr, nameStr);
             }
             else
             {
-                if (flags & CPF_OutParm)
+                if ((flags & CPF_OutParm) && !(flags & CPF_ConstParm))
                 {
                     out->Params += fmt::format("{}& {}, ", typeStr, nameStr);
+                }
+                else if ((flags & CPF_OutParm) && (flags & CPF_ConstParm))
+                {
+                    out->Params += fmt::format("const {}& {}, ", typeStr, nameStr);
                 }
                 else
                 {
@@ -235,10 +286,15 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         out->Params.erase(out->Params.size() - 2);
     }
 
-    if (out->CppName.size() == 0)
-    {
-        out->CppName = "void " + SanitizeIdentifier(fn.GetName());
-    }
+    // CppName composes the C++ declaration head emitted in the class body:
+    //   [static ]<ReturnType> <FuncName>
+    // …and AppendStructsToBuffer appends `(<Params>);` to it.
+    out->CppName.clear();
+    if (out->IsStatic)
+        out->CppName += "static ";
+    out->CppName += out->ReturnType;
+    out->CppName += ' ';
+    out->CppName += sanitizedFuncName;
 }
 
 void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &arr)
@@ -382,6 +438,8 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             auto fn = child.Cast<UE_UFunction>();
             Function f;
             GenerateFunction(fn, &f);
+            f.OwnerCppName = s.CppNameOnly;
+            f.OwnerUEName = s.Name;
             // Function param/return types reference other types but only
             // through value/reference parameters in declarations — these
             // can use forward declarations because the function body lives

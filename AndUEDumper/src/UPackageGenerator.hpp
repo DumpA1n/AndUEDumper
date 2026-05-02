@@ -21,12 +21,24 @@ public:
         uint32_t Offset = 0;
         uint32_t Size = 0;
     };
+    struct Param
+    {
+        std::string Type;     // sanitized C++ type, e.g. "FVector"
+        std::string Name;     // sanitized identifier (keyword-safe)
+        uint64_t    Flags = 0; // CPF_* flags from prop->GetPropertyFlags()
+        int32_t     ArrayDim = 1;
+    };
     struct Function
     {
         std::string Name;
         std::string FullName;
-        std::string CppName;
-        std::string Params;
+        std::string CppName;        // "[static ]<ReturnType> <FuncName>"
+        std::string Params;         // "(Type Name, Type& OutName, ...)"  payload only
+        std::string ReturnType;     // "void" / "FVector" / ...
+        std::string OwnerCppName;   // CppNameOnly of the parent struct, e.g. "UAnimNotify" — used as the C++ qualifier in out-of-line bodies
+        std::string OwnerUEName;    // UE FName of the parent struct, e.g. "AnimNotify" — passed to UClass::GetFunction at runtime
+        std::vector<Param> ParamsList;
+        bool        IsStatic = false; // FUNC_Static
         uint32_t EFlags = 0;
         std::string Flags;
         int8_t NumParams = 0;
