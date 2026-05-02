@@ -1879,6 +1879,27 @@ static void EmitPackageFunctionBodies(BufferFmt &buf,
     }
 }
 
+// Strip a UTF-8 BOM (EF BB BF) embedded at the start of an embedded source.
+// The UECore raw-string embeds reproduce their source files byte-for-byte;
+// `source/UEProber/UECore/UnrealContainers.h` ships with a BOM, which makes
+// clang reject the dumped output ("unexpected character <U+FEFF>"). The
+// embedded raw string starts with a newline (the opening `R"UECoreUC(` is
+// on its own line), so the BOM lands at offset 1. Handle both shapes.
+static std::string StripUtf8Bom(std::string content)
+{
+    constexpr const char *kBom = "\xef\xbb\xbf";
+    if (content.compare(0, 3, kBom) == 0)
+    {
+        content.erase(0, 3);
+    }
+    else if (content.size() >= 4 && content[0] == '\n'
+             && content.compare(1, 3, kBom) == 0)
+    {
+        content.erase(1, 3);
+    }
+    return content;
+}
+
 // Substitute the embedded `#define bWITH_CASE_PRESERVING_NAME false` with
 // `... true` when the per-game profile flags case-preserving FName. The
 // switch flips ComparisonIndex/DisplayIndex from a 4-byte union into two
@@ -1920,17 +1941,22 @@ static void EmitSDKCoreFiles(
     // Basic.h's bWITH_CASE_PRESERVING_NAME #define is patched per-profile
     // so the embedded FName layout (8B union vs 12B separate fields)
     // matches the per-game UE_Offsets::FName.Size.
+    //
+    // StripUtf8Bom is applied to every embed: the source UECore files may
+    // ship with a UTF-8 BOM (currently UnrealContainers.h does), which
+    // clang rejects as "unexpected character <U+FEFF>" when the dumped
+    // output is included in a TU.
     outBuffersMap[prefix + "Basic.h"].append("{}",
-        ApplyCasePreservingDefine(kUECoreBasicH, casePreserving));
-    outBuffersMap[prefix + "Basic.cpp"].append("{}", kUECoreBasicCpp);
-    outBuffersMap[prefix + "UnrealContainers.h"].append("{}", kUECoreUnrealContainersH);
+        StripUtf8Bom(ApplyCasePreservingDefine(kUECoreBasicH, casePreserving)));
+    outBuffersMap[prefix + "Basic.cpp"].append("{}", StripUtf8Bom(kUECoreBasicCpp));
+    outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
 
     // utfcpp dependency: UnrealContainers.h's FString::ToString uses
     // utf8::unchecked::utf16to8 on GCC/Clang. Drop the two-file utfcpp
     // subset (unchecked.h + its core.h) under <prefix>utfcpp/ so the
     // SDK directory is fully self-contained.
-    outBuffersMap[prefix + "utfcpp/core.h"].append("{}", kUtfcppCoreH);
-    outBuffersMap[prefix + "utfcpp/unchecked.h"].append("{}", kUtfcppUncheckedH);
+    outBuffersMap[prefix + "utfcpp/core.h"].append("{}", StripUtf8Bom(kUtfcppCoreH));
+    outBuffersMap[prefix + "utfcpp/unchecked.h"].append("{}", StripUtf8Bom(kUtfcppUncheckedH));
 
     // ---- 2. CoreUObject_structs.hpp ------------------------------------
     {
