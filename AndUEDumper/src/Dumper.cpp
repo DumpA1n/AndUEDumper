@@ -1494,11 +1494,27 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
 }
 
 // ============================================================================
-//  DumpSDK_PerPackage (Plan A) — Basic.hpp + <pkg>.hpp x N + SDK.hpp.
+//  DumpSDK_PerPackage (Plan A) — UECore-style separation of infra and pkgs.
 //
-//  Each package gets a single header that #includes Basic.hpp + every
-//  cross-package full-type dep. Lets callers `#include "SDK_A/CoreUObject.hpp"`
-//  and pull just FVector/UObject/etc without the rest of the dump.
+//  Layout:
+//    SDK_A/
+//    ├── Basic.hpp           preamble (FName, TUObjectArray, ...), forward
+//    │                       decls of every dumped type, phantom decls,
+//    │                       StringLiteral / DEFINE_UE_CLASS_HELPERS macro,
+//    │                       StaticClassImpl<>/GetDefaultObjImpl<> fwd.
+//    ├── CoreHelpers.hpp     inline UObject method bodies + StaticClassImpl
+//    │                       definition + AIOCore::kProcessEventIndex.
+//    │                       Pulls Packages/CoreUObject.hpp transitively.
+//    ├── SDK.hpp             aggregator (Basic + every package + CoreHelpers).
+//    └── Packages/
+//        ├── CoreUObject.hpp dumped UObject/UClass/FVector/... etc.
+//        ├── Engine.hpp
+//        └── ...             one .hpp per dumped UE package.
+//
+//  Each Packages/<pkg>.hpp is self-contained for its types (#includes
+//  Basic + cross-pkg deps). User can pull just one package, but to call
+//  helpers like Obj->GetName() they need CoreHelpers.hpp too — SDK.hpp
+//  bundles everything in dep order.
 // ============================================================================
 void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap)
 {
@@ -1509,6 +1525,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     }
 
     const std::string prefix = "SDK_A/";
+    const std::string pkgPrefix = prefix + "Packages/";
 
     // Basic.hpp — preamble + global forward decls + phantom decls
     {
@@ -1540,15 +1557,15 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         }
     }
 
-    // Per-package: <pkg>.hpp
+    // Per-package: Packages/<pkg>.hpp
     for (size_t pkgIdx : _sdkPkgOrder)
     {
         auto &pkg = _sdkProcessed[pkgIdx];
-        const std::string fname = prefix + pkg.PackageName + ".hpp";
+        const std::string fname = pkgPrefix + pkg.PackageName + ".hpp";
         auto &buf = outBuffersMap[fname];
 
         buf.append("#pragma once\n\n");
-        buf.append("#include \"Basic.hpp\"\n");
+        buf.append("#include \"../Basic.hpp\"\n");
 
         std::set<std::string> depPkgs;
         auto collect = [&](const UE_UPackage::Struct &s) {
@@ -1573,24 +1590,41 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &buf);
         if (!pkg.Classes.empty())    UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
 
-        if (pkg.PackageName == "CoreUObject")
-            EmitAIOCoreHelpersBlock(buf, _processEventIndex);
+        // Helpers block intentionally NOT emitted here anymore — moved to
+        // SDK_A/CoreHelpers.hpp so package files only contain dumped types.
+    }
+
+    // CoreHelpers.hpp — inline impls of UObject methods + StaticClassImpl<>
+    // / GetDefaultObjImpl<> bodies + AIOCore::kProcessEventIndex.
+    {
+        auto &buf = outBuffersMap[prefix + "CoreHelpers.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("// Inline definitions of UObject helpers (ProcessEvent dispatch,\n");
+        buf.append("// GetName, IsA, FindObject, ...) and the StaticClassImpl<> /\n");
+        buf.append("// GetDefaultObjImpl<> templates used by DEFINE_UE_CLASS_HELPERS.\n");
+        buf.append("// Requires the dumped UObject / UClass / UStruct definitions to\n");
+        buf.append("// be in scope — pulled via the explicit CoreUObject include.\n\n");
+        buf.append("#include \"Packages/CoreUObject.hpp\"\n");
+        EmitAIOCoreHelpersBlock(buf, _processEventIndex);
     }
 
     // SDK.hpp aggregator
     {
         auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
         sdkBuf.append("#pragma once\n\n");
-        sdkBuf.append("// Aggregator: every per-package header in topological order.\n\n");
+        sdkBuf.append("// Aggregator: Basic.hpp + every per-package header in topological\n");
+        sdkBuf.append("// order + CoreHelpers.hpp (must come last — needs UObject defined).\n\n");
+        sdkBuf.append("#include \"Basic.hpp\"\n\n");
         for (size_t pkgIdx : _sdkPkgOrder)
         {
             const auto &pkg = _sdkProcessed[pkgIdx];
-            sdkBuf.append("#include \"{}.hpp\"\n", pkg.PackageName);
+            sdkBuf.append("#include \"Packages/{}.hpp\"\n", pkg.PackageName);
         }
+        sdkBuf.append("\n#include \"CoreHelpers.hpp\"\n");
     }
 
-    logsBufferFmt.append("SDK Plan A: emitted {}Basic.hpp + {} package files + {}SDK.hpp\n",
-                         prefix, _sdkPkgOrder.size(), prefix);
+    logsBufferFmt.append("SDK Plan A: emitted {}Basic.hpp + {}CoreHelpers.hpp + {}SDK.hpp + {}Packages/ ({} files)\n",
+                         prefix, prefix, prefix, prefix, _sdkPkgOrder.size());
     logsBufferFmt.append("==========================\n");
 }
 
