@@ -15,6 +15,7 @@ using namespace UEMemory;
 
 #include "UPackageGenerator.hpp"
 #include "UECoreEmbed.hpp"
+#include "UtfcppEmbed.hpp"
 
 #define kVECTOR_CONTAINS(vec, val) (std::find(vec.begin(), vec.end(), val) != vec.end())
 
@@ -1613,6 +1614,13 @@ static void EmitSDKCoreFiles(
         ApplyCasePreservingDefine(kUECoreBasicH, casePreserving));
     outBuffersMap[prefix + "Basic.cpp"].append("{}", kUECoreBasicCpp);
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", kUECoreUnrealContainersH);
+
+    // utfcpp dependency: UnrealContainers.h's FString::ToString uses
+    // utf8::unchecked::utf16to8 on GCC/Clang. Drop the two-file utfcpp
+    // subset (unchecked.h + its core.h) under <prefix>utfcpp/ so the
+    // SDK directory is fully self-contained.
+    outBuffersMap[prefix + "utfcpp/core.h"].append("{}", kUtfcppCoreH);
+    outBuffersMap[prefix + "utfcpp/unchecked.h"].append("{}", kUtfcppUncheckedH);
 
     // ---- 2. CoreUObject_structs.hpp ------------------------------------
     {
