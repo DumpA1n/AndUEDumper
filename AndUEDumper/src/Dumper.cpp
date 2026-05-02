@@ -367,10 +367,99 @@ struct TArray
 
 struct FString : TArray<wchar_t> {};
 
-struct FName
+// FName matches UECore Basic.h's layout (8 bytes: ComparisonIndex + Number).
+// s_NameResolver is the FName -> ANSI string hook the user wires once at
+// startup — required because some games encrypt the FName pool, so the
+// translation can't be baked at dump time. ToString() also strips the
+// outer-package path component (so "Engine.Actor" becomes "Actor"),
+// matching UECore's GetName() semantics.
+class FName final
 {
+public:
+    static inline std::function<std::string(int32_t)> s_NameResolver;
+
     int32_t ComparisonIndex;
     uint32_t Number;
+
+    static std::string GetPlainANSIString(const FName* N)
+    {
+        if (s_NameResolver) return s_NameResolver(N->ComparisonIndex);
+        return {};
+    }
+    std::string GetRawString() const { return GetPlainANSIString(this); }
+    std::string ToString() const
+    {
+        std::string s = GetRawString();
+        size_t pos = s.rfind('/');
+        return pos == std::string::npos ? s : s.substr(pos + 1);
+    }
+    bool operator==(const FName& O) const
+    { return ComparisonIndex == O.ComparisonIndex && Number == O.Number; }
+    bool operator!=(const FName& O) const { return !(*this == O); }
+};
+
+// Forward decl — UObject defined later by the dumper but referenced from
+// FUObjectItem / TUObjectArray below.
+struct UObject;
+
+// Per-slot record in the GObjects table. Object pointer at offset 0;
+// the rest is engine bookkeeping (flags, cluster index, ...).
+struct FUObjectItem
+{
+    UObject* Object;
+    uint8_t Pad_8[0x10];
+};
+
+// Chunked global object array. Layout matches UE 4.20+ TUObjectArray.
+// NumElementsPerChunk = 0 disables chunking (older UE / non-chunked
+// builds); set it to 65536 (the modern default) at runtime if needed.
+class TUObjectArray
+{
+public:
+    int32_t NumElementsPerChunk = 0x10000; // 65536
+    FUObjectItem** Objects;
+    uint8_t Pad_8[0x8];
+    int32_t MaxElements;
+    int32_t NumElements;
+    int32_t MaxChunks;
+    int32_t NumChunks;
+
+    inline int32_t Num() const { return NumElements; }
+
+    inline UObject* GetByIndex(const int32_t Index) const
+    {
+        if (Index < 0 || Index >= NumElements || !Objects)
+            return nullptr;
+        // Object is at offset 0 of FUObjectItem.
+        if (NumElementsPerChunk <= 0)
+        {
+            return *reinterpret_cast<UObject**>(
+                reinterpret_cast<uintptr_t>(Objects) + Index * sizeof(FUObjectItem));
+        }
+        const int32_t ChunkIndex = Index / NumElementsPerChunk;
+        const int32_t WithinChunkIndex = Index % NumElementsPerChunk;
+        uintptr_t chunk = *reinterpret_cast<uintptr_t*>(Objects + ChunkIndex);
+        if (!chunk) return nullptr;
+        return *reinterpret_cast<UObject**>(
+            chunk + WithinChunkIndex * sizeof(FUObjectItem));
+    }
+};
+
+// Late-binding pointer wrapper: user code only knows the address of
+// GUObjectArray after dlopen + offset resolution, so GObjects holds a
+// void* and lazily reinterprets it as a TUObjectArray*. Wire via
+// `UObject::GObjects.InitManually(addr)` once at startup.
+class TUObjectArrayWrapper
+{
+private:
+    void* GObjectsAddress = nullptr;
+public:
+    inline void InitManually(void* Addr) { GObjectsAddress = Addr; }
+    inline TUObjectArray* operator->()
+    { return reinterpret_cast<TUObjectArray*>(GObjectsAddress); }
+    inline const TUObjectArray* operator->() const
+    { return reinterpret_cast<const TUObjectArray*>(GObjectsAddress); }
+    inline operator bool() const { return GObjectsAddress != nullptr; }
 };
 
 struct FText
@@ -533,26 +622,12 @@ inline T* GetDefaultObjImpl();
     static struct UClass* StaticClass() { return StaticClassImpl<ClassNameStr>(); } \
     static struct FullClassName* GetDefaultObj() { return GetDefaultObjImpl<FullClassName>(); }
 
-// Runtime hooks consumed by the AIOCore inline helpers. Wire these from
-// your bridge code once at startup. Function pointers (not std::function)
-// keep the generated header self-contained.
-namespace AIOCore
-{
-    // Resolve an FName ComparisonIndex to its ANSI string. Used by
-    // UObject::GetName / GetFullName.
-    using NameResolverFn = const char* (*)(int32_t comparisonIndex);
-    inline NameResolverFn g_NameResolver = nullptr;
-
-    // Combined object lookup. `isFullName=false` means short-name lookup
-    // (FindObjectFast / FindClassFast / StaticClassImpl path);
-    // `isFullName=true` matches against `Class Outer.Object` paths
-    // (FindObject / FindClass). `castFlagsBits` is the EClassCastFlags
-    // value-as-uint64; pass 0 to disable type filtering.
-    using FindObjectFn = struct UObject* (*)(const char* nameOrFullName,
-                                             bool isFullName,
-                                             uint64_t castFlagsBits);
-    inline FindObjectFn g_FindObject = nullptr;
-}
+// AIOCore namespace exists for the kProcessEventIndex constant emitted
+// by the helpers block at the bottom of the header. The other runtime
+// glue is on the types themselves: FName::s_NameResolver (FName decode,
+// game-specific because some pool layouts are encrypted) and
+// UObject::GObjects (wire via InitManually(GUObjectArray address)).
+// Both wired once from your bridge.
 
 #endif // AIOHeader_BASIC_TYPES_DEFINED
 )AIOPRE";
@@ -850,12 +925,14 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 // === AIO Core helpers (inline bodies at end of header) ===
                 //
                 // ProcessEvent dispatches via vtable[ProcessEventIndex]; the
-                // remaining helpers walk the typed members added above
-                // (ClassPrivate / OuterPrivate / NamePrivate / ObjectFlags)
-                // plus UStruct::SuperStruct (added when UStruct is augmented
-                // in this same pass) and UClass::{CastFlags,DefaultObject}.
-                // Lookups (FindObject*, FindClass*, GetName) route through
-                // the user-wired AIOCore::g_* hooks declared in kAIOPreamble.
+                // rest walk the typed members added above (ClassPrivate /
+                // OuterPrivate / NamePrivate / ObjectFlags) plus
+                // UStruct::SuperStruct (added when UStruct is augmented in
+                // this same pass) and UClass::{CastFlags,DefaultObject}.
+                // GetName / Name lookup goes through FName::s_NameResolver
+                // (game-specific, FName pool can be encrypted). Object
+                // lookup (FindObject*, FindClass*) walks GObjects directly
+                // — wire via UObject::GObjects.InitManually(addr) once.
                 //
                 // EClassCastFlags is forward-declared in kAIOPreamble with
                 // an explicit uint64_t underlying type — that's enough for
@@ -864,6 +941,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 // actual flag enumerators (e.g. EClassCastFlags::Actor).
                 s.ExtraDecls =
                     "\t// === AIO Core helpers (inline bodies at end of header) ===\n"
+                    "\tstatic inline class TUObjectArrayWrapper GObjects;\n"
+                    "\n"
                     "\tvoid ProcessEvent(struct UFunction* Function, void* Parms) const;\n"
                     "\n"
                     "\tstd::string GetName() const;\n"
@@ -1136,12 +1215,14 @@ static void EmitAIOCoreHelpersBlock(BufferFmt &buf, int processEventIndex,
 {
     buf.append("\n// === AIO Core Helpers ===\n");
     buf.append("// Generated runtime glue tying the dumped UE reflection layout to\n");
-    buf.append("// per-game offsets discovered during the dump. The ProcessEvent\n");
-    buf.append("// vtable slot baked in here lets `Obj->ProcessEvent(Func, &Parms)`\n");
-    buf.append("// dispatch correctly without a separate runtime initialiser.\n//\n");
-    buf.append("// Other helpers (GetName, IsA, FindObject, ...) route through the\n");
-    buf.append("// AIOCore::g_NameResolver / g_FindObject hooks declared in the\n");
-    buf.append("// preamble. Wire those once from your bridge before calling them.\n\n");
+    buf.append("// per-game offsets discovered during the dump.\n");
+    buf.append("//\n");
+    buf.append("// Wire two things from your bridge once at startup:\n");
+    buf.append("{}", "//   FName::s_NameResolver = [](int32_t idx){ return ResolveByID(idx); };\n");
+    buf.append("//   UObject::GObjects.InitManually(GUObjectArrayPtr);\n");
+    buf.append("// Everything else (ProcessEvent dispatch, FindObject walks, type\n");
+    buf.append("// queries) is fully derived from the dumped layout + per-game\n");
+    buf.append("// offsets — no other hooks needed.\n\n");
     buf.append("#ifndef AIOHeader_CORE_HELPERS_DEFINED\n");
     buf.append("#define AIOHeader_CORE_HELPERS_DEFINED\n\n");
 
@@ -1174,9 +1255,7 @@ inline void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 // ---- Name helpers --------------------------------------------------
 inline std::string UObject::GetName() const
 {
-    if (!AIOCore::g_NameResolver) return {};
-    const char* s = AIOCore::g_NameResolver(NamePrivate.ComparisonIndex);
-    return s ? std::string(s) : std::string();
+    return NamePrivate.ToString();
 }
 
 inline std::string UObject::GetFullName() const
@@ -1242,19 +1321,36 @@ inline void UObject::TraverseSupers(const std::function<bool(const UObject*)>& C
     }
 }
 
-// ---- Object lookup -------------------------------------------------
+// ---- Object lookup --------------------------------------------------
+// Walks GObjects directly — same structure as Dumper-7's UECore reference
+// (CoreUObject_functions.cpp). Requires UObject::GObjects to be wired.
 inline UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
 {
-    if (!AIOCore::g_FindObject) return nullptr;
-    return AIOCore::g_FindObject(FullName.c_str(), /*isFullName*/true,
-                                 static_cast<uint64_t>(RequiredType));
+    if (!GObjects) return nullptr;
+    const int32_t N = GObjects->Num();
+    for (int32_t i = 0; i < N; ++i)
+    {
+        UObject* Object = GObjects->GetByIndex(i);
+        if (!Object || (reinterpret_cast<uintptr_t>(Object) & 0x7) != 0)
+            continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetFullName() == FullName)
+            return Object;
+    }
+    return nullptr;
 }
 
 inline UObject* UObject::FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType)
 {
-    if (!AIOCore::g_FindObject) return nullptr;
-    return AIOCore::g_FindObject(Name.c_str(), /*isFullName*/false,
-                                 static_cast<uint64_t>(RequiredType));
+    if (!GObjects) return nullptr;
+    const int32_t N = GObjects->Num();
+    for (int32_t i = 0; i < N; ++i)
+    {
+        UObject* Object = GObjects->GetByIndex(i);
+        if (!Object) continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetName() == Name)
+            return Object;
+    }
+    return nullptr;
 }
 
 inline UClass* UObject::FindClass(const std::string& ClassFullName)
@@ -1274,17 +1370,17 @@ inline UClass* UObject::FindClassFast(const std::string& ClassName)
         buf.append("{}", R"AIOTPL(// ---- StaticClassImpl<> / GetDefaultObjImpl<> templates -------------
 // Forward-declared in the preamble; full definitions here so the
 // DEFINE_UE_CLASS_HELPERS macro instantiations resolve when user code
-// pulls in this header.
+// pulls in this header. Caches the resolved UClass* per template
+// instantiation (one static per (FullClassName, ClassNameStr) pair).
 template<StringLiteral Name>
 inline UClass* StaticClassImpl()
 {
     static UClass* Cached = nullptr;
-    if (!Cached && AIOCore::g_FindObject)
+    if (!Cached)
     {
-        Cached = static_cast<UClass*>(
-            AIOCore::g_FindObject(static_cast<const char*>(Name.Chars),
-                                  /*isFullName*/false,
-                                  /*castFlagsBits*/0x20)); // ::Class
+        Cached = UObject::FindObjectFast<UClass>(
+            std::string(static_cast<const char*>(Name.Chars)),
+            EClassCastFlags{0x20}); // ::Class
     }
     return Cached;
 }
@@ -1595,28 +1691,7 @@ void UEDumper::DumpSDK_UECoreStyle(BufferFmt &logsBufferFmt, std::unordered_map<
         buf.append("// Package: CoreUObject - Classes({})\n\n", pkg.Classes.size());
 
         if (!pkg.Classes.empty())
-        {
-            // Splice Plan B-only static into UObject: the embedded Basic.cpp
-            // and FWeakObjectPtr operators reach into UObject::GObjects;
-            // user wires it via SDK::UObject::GObjects.InitManually(addr)
-            // at startup. (Plan A's preamble has no TUObjectArrayWrapper
-            // type so we don't add this on the shared ExtraDecls.)
-            std::vector<UE_UPackage::Struct> classesCopy = pkg.Classes;
-            for (auto &c : classesCopy)
-            {
-                if (c.CppNameOnly == "UObject")
-                {
-                    std::string injection =
-                        "\t// Plan B / UECore-style global object table. Wire via\n"
-                        "\t// SDK::UObject::GObjects.InitManually(<GUObjectArray addr>)\n"
-                        "\t// once at startup before calling FindObject* / FWeakObjectPtr.\n"
-                        "\tstatic inline class TUObjectArrayWrapper GObjects;\n\n";
-                    c.ExtraDecls = injection + c.ExtraDecls;
-                    break;
-                }
-            }
-            UE_UPackage::AppendStructsToBuffer(classesCopy, &buf);
-        }
+            UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
 
         // Helper bodies — skip StaticClassImpl/GetDefaultObjImpl templates
         // (Basic.h provides those, with its own BasicFilesImpleUtils chain).
