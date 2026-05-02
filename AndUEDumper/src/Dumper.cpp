@@ -2,6 +2,11 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
@@ -324,18 +329,206 @@ void UEDumper::GatherUObjects(BufferFmt &logsBufferFmt, BufferFmt &objsBufferFmt
     logsBufferFmt.append("==========================\n");
 }
 
+// Self-contained preamble with minimal layout-correct stubs for the predefined
+// UE types that the dumper references in member type strings (FName, FString,
+// containers, smart pointers, delegates, etc.). Sizes match what the dumper
+// itself reports in the AIOHeader (// 0xX(0xY) comments).
+//
+// Guarded by AIOHeader_BASIC_TYPES_DEFINED so callers that already provide
+// their own definitions (e.g. UECore in this project) can opt out by
+// #defining the guard before including AIOHeader.hpp.
+static const char *kAIOPreamble = R"AIOPRE(
+#ifndef AIOHeader_BASIC_TYPES_DEFINED
+#define AIOHeader_BASIC_TYPES_DEFINED
+
+// Placeholders the dumper emits when an inner type couldn't be resolved.
+// Kept incomplete on purpose — only valid through pointer/template usage.
+struct None;
+struct FNone;
+
+template <typename T>
+struct TArray
+{
+    T* Data;
+    int32_t NumElements;
+    int32_t MaxElements;
+};
+
+struct FString : TArray<wchar_t> {};
+
+struct FName
+{
+    int32_t ComparisonIndex;
+    uint32_t Number;
+};
+
+struct FText
+{
+    uint8_t Pad_0[24];
+};
+
+template <typename K, typename V>
+struct TPair
+{
+    K Key;
+    V Value;
+};
+
+template <typename K, typename V>
+struct TMap
+{
+    uint8_t Pad_0[80];
+};
+
+template <typename T>
+struct TSet
+{
+    uint8_t Pad_0[80];
+};
+
+struct FWeakObjectPtr
+{
+    int32_t ObjectIndex;
+    int32_t ObjectSerialNumber;
+};
+
+template <typename T>
+struct TWeakObjectPtr : FWeakObjectPtr {};
+
+struct FUniqueObjectGuid
+{
+    uint32_t A, B, C, D;
+};
+
+template <typename T>
+struct TLazyObjectPtr
+{
+    FWeakObjectPtr WeakPtr;
+    int32_t TagAtLastTest;
+    FUniqueObjectGuid ObjectID;
+};
+
+// FSoftObjectPath is emitted by the dump itself (CoreUObject.SoftObjectPath)
+// — its layout depends on FName size, which varies per game. We opaque-ify
+// FSoftObjectPtr here so it doesn't need a complete FSoftObjectPath at
+// preamble-emission time. Size pinned at 40 to match TSoftObjectPtr<T>
+// observed in dumps.
+struct FSoftObjectPtr
+{
+    uint8_t Pad_0[40];
+};
+
+template <typename T>
+struct TSoftObjectPtr : FSoftObjectPtr {};
+
+template <typename T>
+struct TSoftClassPtr : FSoftObjectPtr {};
+
+template <typename T>
+struct TSubclassOf
+{
+    void* ClassPtr;
+};
+
+struct FScriptInterface
+{
+    void* ObjectPointer;
+    void* InterfacePointer;
+};
+
+template <typename T>
+struct TScriptInterface : FScriptInterface {};
+
+struct FFieldClass
+{
+    uint8_t Pad_0[40];
+};
+
+struct FProperty
+{
+    uint8_t Pad_0[136];
+};
+
+struct FFieldPath
+{
+    void* ResolvedField;
+    TWeakObjectPtr<void> ResolvedOwner;
+    TArray<FName> Path;
+};
+
+template <typename T>
+struct TFieldPath : FFieldPath {};
+
+struct FScriptDelegate
+{
+    FWeakObjectPtr Object;
+    FName FunctionName;
+};
+
+struct FDelegate
+{
+    FScriptDelegate BoundFunction;
+};
+
+struct FMulticastInlineDelegate
+{
+    TArray<FScriptDelegate> InvocationList;
+};
+
+struct FMulticastDelegate
+{
+    TArray<FScriptDelegate> InvocationList;
+};
+
+struct FMulticastSparseDelegate
+{
+    void* SparseInvocationList;
+    uint8_t Pad_8[8];
+};
+
+#endif // AIOHeader_BASIC_TYPES_DEFINED
+)AIOPRE";
+
+// Topological sort using DFS — produces a "deps first" ordering. For nodes
+// with cycles, we emit them in the order DFS encountered them (this keeps
+// behavior deterministic; callers that need full cycle resolution must
+// supplement with forward declarations).
+template <typename Node, typename DepsFn>
+static std::vector<Node> TopoSort(const std::vector<Node> &nodes, DepsFn getDeps)
+{
+    enum class State : uint8_t { Unvisited, Visiting, Visited };
+    std::unordered_map<Node, State> state;
+    state.reserve(nodes.size());
+    for (const auto &n : nodes) state.emplace(n, State::Unvisited);
+
+    std::vector<Node> out;
+    out.reserve(nodes.size());
+
+    std::function<void(const Node &)> dfs = [&](const Node &n)
+    {
+        auto it = state.find(n);
+        if (it == state.end()) return;            // not in our universe
+        if (it->second != State::Unvisited) return; // visited or in progress (cycle)
+        it->second = State::Visiting;
+        for (const auto &dep : getDeps(n))
+        {
+            dfs(dep);
+        }
+        it->second = State::Visited;
+        out.push_back(n);
+    };
+
+    for (const auto &n : nodes) dfs(n);
+    return out;
+}
+
 void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback)
 {
-    int packages_saved = 0;
-    std::string packages_unsaved{};
-
     int classes_saved = 0;
     int structs_saved = 0;
     int enums_saved = 0;
 
     static bool processInternal_once = false;
-
-    aioBufferFmt.append("#pragma once\n\n#include <cstdio>\n#include <string>\n#include <cstdint>\n\n\n");
 
     SimpleProgressBar dumpProgress(int(packages.size()));
     if (progressCallback)
@@ -343,84 +536,337 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
 
     auto excludedObjects = _profile->GetExcludedObjects();
 
-    for (UE_UPackage package : packages)
+    // ---- Phase 1: process every package and collect type metadata ------------
+
+    std::vector<UE_UPackage> processed;
+    processed.reserve(packages.size());
+
+    auto isExcluded = [&excludedObjects](const std::string &fullName)
     {
-        package.Process();
+        return !excludedObjects.empty() && kVECTOR_CONTAINS(excludedObjects, fullName);
+    };
+
+    for (auto &raw : packages)
+    {
+        UE_UPackage pkg(raw);
+        pkg.Process();
 
         dumpProgress++;
         if (progressCallback)
             progressCallback(dumpProgress);
 
-        if (package.Classes.size() || package.Structures.size() || package.Enums.size())
+        if (excludedObjects.size())
         {
-            aioBufferFmt.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
-                                package.GetObject().GetName(), package.Enums.size(), package.Structures.size(), package.Classes.size());
+            pkg.Enums.erase(
+                std::remove_if(pkg.Enums.begin(), pkg.Enums.end(),
+                               [&](const UE_UPackage::Enum &it){ return isExcluded(it.FullName); }),
+                pkg.Enums.end());
+            pkg.Structures.erase(
+                std::remove_if(pkg.Structures.begin(), pkg.Structures.end(),
+                               [&](const UE_UPackage::Struct &it){ return isExcluded(it.FullName); }),
+                pkg.Structures.end());
+            pkg.Classes.erase(
+                std::remove_if(pkg.Classes.begin(), pkg.Classes.end(),
+                               [&](const UE_UPackage::Struct &it){ return isExcluded(it.FullName); }),
+                pkg.Classes.end());
+        }
 
-            if (package.Enums.size())
+        processed.push_back(std::move(pkg));
+    }
+
+    // ---- Phase 1.5: drop preamble-provided names + collapse duplicates -----
+    //
+    // The preamble defines FName/FString/FText, FSoftObjectPath, all wrapper
+    // templates (TArray/TMap/...), and a handful of basic FProperty/FField
+    // helpers. Real UE dumps re-emit some of these as ScriptStructs, so we
+    // skip them here to avoid double definitions.
+    //
+    // Real dumps also produce duplicate names from objects whose FName came
+    // back as "None" (UNone × N) or from games that genuinely contain two
+    // unrelated classes with the same short name. We keep the first
+    // occurrence and drop the rest — references via member type strings
+    // resolve to the surviving one.
+    {
+        static const std::unordered_set<std::string> kPreambleProvided = {
+            "FName", "FString", "FText",
+            "FWeakObjectPtr", "FUniqueObjectGuid",
+            // Note: FSoftObjectPath is NOT skipped — its layout depends on
+            // the per-game FName size, so we let the dump emit the real one.
+            "FSoftObjectPtr",
+            "FScriptInterface", "FFieldPath", "FFieldClass", "FProperty",
+            "FScriptDelegate", "FDelegate",
+            "FMulticastInlineDelegate", "FMulticastDelegate",
+            "FMulticastSparseDelegate",
+            "TArray", "TMap", "TSet", "TPair",
+            "TWeakObjectPtr", "TLazyObjectPtr",
+            "TSoftObjectPtr", "TSoftClassPtr",
+            "TSubclassOf", "TScriptInterface", "TFieldPath",
+            "None", "FNone",
+        };
+
+        std::unordered_set<std::string> seenNames = kPreambleProvided;
+
+        auto dropDups = [&seenNames](auto &vec)
+        {
+            using ItemT = typename std::remove_reference_t<decltype(vec)>::value_type;
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(),
+                               [&seenNames](const ItemT &it)
+                               {
+                                   if (seenNames.count(it.CppNameOnly)) return true;
+                                   seenNames.insert(it.CppNameOnly);
+                                   return false;
+                               }),
+                vec.end());
+        };
+
+        for (auto &p : processed)
+        {
+            dropDups(p.Enums);
+            dropDups(p.Structures);
+            dropDups(p.Classes);
+        }
+    }
+
+    // Drop packages that ended up with nothing to emit
+    std::string packages_unsaved;
+    {
+        std::vector<UE_UPackage> kept;
+        kept.reserve(processed.size());
+        for (auto &p : processed)
+        {
+            if (!p.Classes.empty() || !p.Structures.empty() || !p.Enums.empty())
             {
-                auto pkgEnums = package.Enums;
-
-                if (excludedObjects.size())
-                {
-                    pkgEnums.erase(
-                        std::remove_if(pkgEnums.begin(), pkgEnums.end(),
-                                       [&excludedObjects](const UE_UPackage::Enum &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgEnums.end());
-                }
-
-                UE_UPackage::AppendEnumsToBuffer(pkgEnums, &aioBufferFmt);
+                kept.push_back(std::move(p));
             }
-
-            if (package.Structures.size())
+            else
             {
-                auto pkgStructs = package.Structures;
-
-                if (excludedObjects.size())
-                {
-                    pkgStructs.erase(
-                        std::remove_if(pkgStructs.begin(), pkgStructs.end(),
-                                       [&excludedObjects](const UE_UPackage::Struct &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgStructs.end());
-                }
-
-                UE_UPackage::AppendStructsToBuffer(pkgStructs, &aioBufferFmt);
-            }
-
-            if (package.Classes.size())
-            {
-                auto pkgClasses = package.Classes;
-
-                if (excludedObjects.size())
-                {
-                    pkgClasses.erase(
-                        std::remove_if(pkgClasses.begin(), pkgClasses.end(),
-                                       [&excludedObjects](const UE_UPackage::Struct &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgClasses.end());
-                }
-
-                UE_UPackage::AppendStructsToBuffer(package.Classes, &aioBufferFmt);
+                packages_unsaved += "\t";
+                packages_unsaved += p.PackageName + ",\n";
             }
         }
-        else
+        processed = std::move(kept);
+    }
+
+    if (processed.empty())
+    {
+        aioBufferFmt.append("#pragma once\n\n#include <cstdint>\n\n");
+        aioBufferFmt.append("{}\n", kAIOPreamble);
+        logsBufferFmt.append("Saved packages: 0\nSaved classes: 0\nSaved structs: 0\nSaved enums: 0\n");
+        if (!packages_unsaved.empty())
         {
-            packages_unsaved += "\t";
-            packages_unsaved += (package.GetObject().GetName() + ",\n");
-            continue;
+            packages_unsaved.erase(packages_unsaved.size() - 2);
+            logsBufferFmt.append("Unsaved packages: [\n{}\n]\n", packages_unsaved);
+        }
+        logsBufferFmt.append("==========================\n");
+        return;
+    }
+
+    // ---- Phase 2: build name -> package map for cross-package linking --------
+
+    std::unordered_map<std::string, size_t> nameToPkgIdx;
+    nameToPkgIdx.reserve(processed.size() * 64);
+
+    auto registerType = [&](const std::string &name, size_t pkgIdx)
+    {
+        if (name.empty()) return;
+        nameToPkgIdx.emplace(name, pkgIdx);
+    };
+
+    for (size_t i = 0; i < processed.size(); ++i)
+    {
+        for (const auto &s : processed[i].Structures) registerType(s.CppNameOnly, i);
+        for (const auto &c : processed[i].Classes)    registerType(c.CppNameOnly, i);
+        for (const auto &e : processed[i].Enums)      registerType(e.CppNameOnly, i);
+    }
+
+    // ---- Phase 3: build inter-package dependency graph -----------------------
+
+    // Only "full" deps drive package ordering; pure forward-decl deps are
+    // satisfied by the global forward-decl block emitted up front.
+    std::vector<std::unordered_set<size_t>> pkgDeps(processed.size());
+
+    auto recordDeps = [&](size_t pkgIdx, const UE_UPackage::Struct &s)
+    {
+        for (const auto &dep : s.FullDeps)
+        {
+            auto it = nameToPkgIdx.find(dep);
+            if (it == nameToPkgIdx.end()) continue;
+            if (it->second == pkgIdx) continue;
+            pkgDeps[pkgIdx].insert(it->second);
+        }
+    };
+
+    for (size_t i = 0; i < processed.size(); ++i)
+    {
+        for (const auto &s : processed[i].Structures) recordDeps(i, s);
+        for (const auto &c : processed[i].Classes)    recordDeps(i, c);
+    }
+
+    // ---- Phase 4: topological sort packages ----------------------------------
+
+    std::vector<size_t> pkgOrder;
+    pkgOrder.reserve(processed.size());
+    {
+        std::vector<size_t> indices(processed.size());
+        for (size_t i = 0; i < processed.size(); ++i) indices[i] = i;
+
+        pkgOrder = TopoSort<size_t>(indices, [&](size_t i) -> const std::unordered_set<size_t> &
+        {
+            return pkgDeps[i];
+        });
+    }
+
+    // ---- Phase 5: emit AIOHeader ---------------------------------------------
+
+    aioBufferFmt.append("#pragma once\n\n#include <cstdint>\n\n");
+    aioBufferFmt.append("{}\n", kAIOPreamble);
+
+    // 5a. Forward declarations of every dumped enum, struct and class. Pointer
+    //     and template-wrapped references between packages are resolved via
+    //     these forward decls, so cyclic class graphs compile cleanly.
+    aioBufferFmt.append("// === Forward declarations ===\n\n");
+    for (const auto &p : processed)
+    {
+        for (const auto &e : p.Enums)
+            aioBufferFmt.append("enum class {} : {};\n", e.CppNameOnly, e.UnderlyingType);
+    }
+    aioBufferFmt.append("\n");
+    for (const auto &p : processed)
+    {
+        for (const auto &s : p.Structures) aioBufferFmt.append("struct {};\n", s.CppNameOnly);
+        for (const auto &c : p.Classes)    aioBufferFmt.append("struct {};\n", c.CppNameOnly);
+    }
+    aioBufferFmt.append("\n");
+
+    // 5a'. Phantom forward declarations: any name that appears in some
+    //      member's type string but isn't defined by any dumped struct/
+    //      class/enum AND isn't supplied by the preamble. Comes from
+    //      partially-resolved property types (e.g. `TFieldPath<FBoolProperty>`,
+    //      bare `ObjectPtrProperty` returns, `EBlah` enum references where
+    //      the enum object wasn't reachable). We classify by UE prefix.
+    {
+        static const std::unordered_set<std::string> kPreambleNames = {
+            "FName", "FString", "FText",
+            "FWeakObjectPtr", "FUniqueObjectGuid", "FSoftObjectPtr",
+            "FScriptInterface", "FFieldPath", "FFieldClass", "FProperty",
+            "FScriptDelegate", "FDelegate",
+            "FMulticastInlineDelegate", "FMulticastDelegate", "FMulticastSparseDelegate",
+            "TArray", "TMap", "TSet", "TPair",
+            "TWeakObjectPtr", "TLazyObjectPtr",
+            "TSoftObjectPtr", "TSoftClassPtr",
+            "TSubclassOf", "TScriptInterface", "TFieldPath",
+            "None", "FNone",
+        };
+        std::set<std::string> phantomEnums;
+        std::set<std::string> phantomStructs;
+        auto considerName = [&](const std::string &name)
+        {
+            if (name.empty()) return;
+            if (kPreambleNames.count(name)) return;
+            if (nameToPkgIdx.count(name)) return;
+            if (name.size() < 2 || !std::isupper(static_cast<unsigned char>(name[0])))
+                return;
+            const char prefix = name[0];
+            if (prefix == 'E')
+                phantomEnums.insert(name);
+            else if (prefix == 'F' || prefix == 'U' || prefix == 'A' || prefix == 'I')
+                phantomStructs.insert(name);
+            else
+                phantomStructs.insert(name);
+        };
+        for (const auto &p : processed)
+        {
+            auto walk = [&](const UE_UPackage::Struct &s)
+            {
+                for (const auto &n : s.FullDeps)    considerName(n);
+                for (const auto &n : s.ForwardDeps) considerName(n);
+            };
+            for (const auto &s : p.Structures) walk(s);
+            for (const auto &c : p.Classes)    walk(c);
+        }
+        if (!phantomEnums.empty() || !phantomStructs.empty())
+        {
+            aioBufferFmt.append("// === Phantom forward declarations ===\n");
+            aioBufferFmt.append("// Type names referenced in member / function signatures but not\n");
+            aioBufferFmt.append("// defined as a dumped struct/enum (typically partially-resolved\n");
+            aioBufferFmt.append("// property kinds). Forward decls keep pointer / template /\n");
+            aioBufferFmt.append("// signature usages compilable.\n");
+            for (const auto &n : phantomEnums)
+                aioBufferFmt.append("enum class {} : uint8_t;\n", n);
+            for (const auto &n : phantomStructs)
+                aioBufferFmt.append("struct {};\n", n);
+            aioBufferFmt.append("\n");
+        }
+    }
+
+    // 5b. Per-package output, packages in topological order, structs/classes
+    //     within each package sorted by their intra-package full-type deps.
+    auto sortByDeps = [&](size_t pkgIdx, std::vector<UE_UPackage::Struct> &items)
+    {
+        std::unordered_map<std::string, size_t> nameToLocal;
+        nameToLocal.reserve(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+            nameToLocal.emplace(items[i].CppNameOnly, i);
+
+        std::vector<size_t> indices(items.size());
+        for (size_t i = 0; i < items.size(); ++i) indices[i] = i;
+
+        std::vector<std::vector<size_t>> deps(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            for (const auto &dep : items[i].FullDeps)
+            {
+                // Same-package value-type deps must be defined first
+                auto it = nameToLocal.find(dep);
+                if (it != nameToLocal.end()) deps[i].push_back(it->second);
+            }
+        }
+        (void)pkgIdx;
+
+        auto sorted = TopoSort<size_t>(indices, [&](size_t i) -> const std::vector<size_t> &
+        {
+            return deps[i];
+        });
+
+        std::vector<UE_UPackage::Struct> reordered;
+        reordered.reserve(items.size());
+        for (size_t i : sorted) reordered.push_back(std::move(items[i]));
+        items = std::move(reordered);
+    };
+
+    int packages_saved = 0;
+    for (size_t pkgIdx : pkgOrder)
+    {
+        auto &pkg = processed[pkgIdx];
+
+        aioBufferFmt.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
+                            pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
+
+        if (!pkg.Enums.empty())
+            UE_UPackage::AppendEnumsToBuffer(pkg.Enums, &aioBufferFmt);
+
+        if (!pkg.Structures.empty())
+        {
+            sortByDeps(pkgIdx, pkg.Structures);
+            UE_UPackage::AppendStructsToBuffer(pkg.Structures, &aioBufferFmt);
+        }
+
+        if (!pkg.Classes.empty())
+        {
+            sortByDeps(pkgIdx, pkg.Classes);
+            UE_UPackage::AppendStructsToBuffer(pkg.Classes, &aioBufferFmt);
         }
 
         packages_saved++;
-        classes_saved += package.Classes.size();
-        structs_saved += package.Structures.size();
-        enums_saved += package.Enums.size();
+        classes_saved += pkg.Classes.size();
+        structs_saved += pkg.Structures.size();
+        enums_saved += pkg.Enums.size();
 
-        for (const auto &cls : package.Classes)
+        for (const auto &cls : pkg.Classes)
         {
             for (const auto &func : cls.Functions)
             {
-                // UObject::ProcessInternal for blueprint functions
                 if (!processInternal_once && (func.EFlags & FUNC_BlueprintEvent) && func.Func)
                 {
                     dumper_jf_ns::jsonFunctions.push_back({"UObject", "ProcessInternal", func.Func});
@@ -436,7 +882,7 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
             }
         }
 
-        for (const auto &st : package.Structures)
+        for (const auto &st : pkg.Structures)
         {
             for (const auto &func : st.Functions)
             {
@@ -452,7 +898,7 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
 
     logsBufferFmt.append("Saved packages: {}\nSaved classes: {}\nSaved structs: {}\nSaved enums: {}\n", packages_saved, classes_saved, structs_saved, enums_saved);
 
-    if (packages_unsaved.size())
+    if (!packages_unsaved.empty())
     {
         packages_unsaved.erase(packages_unsaved.size() - 2);
         logsBufferFmt.append("Unsaved packages: [\n{}\n]\n", packages_unsaved);

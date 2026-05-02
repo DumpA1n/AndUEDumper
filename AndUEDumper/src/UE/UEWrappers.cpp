@@ -817,7 +817,11 @@ std::string UE_UByteProperty::GetTypeStr() const
 {
     auto e = GetEnum();
     if (e)
-        return "enum class " + e.GetName();
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return "uint8_t";
 }
 
@@ -963,9 +967,13 @@ UE_UEnum UE_UEnumProperty::GetEnum() const
 
 std::string UE_UEnumProperty::GetTypeStr() const
 {
-    if (GetEnum())
-        return "enum class " + GetEnum().GetName();
-
+    auto e = GetEnum();
+    if (e)
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return GetUnderlayingProperty().GetType().second;
 }
 
@@ -1425,7 +1433,11 @@ std::string UE_FByteProperty::GetTypeStr() const
 {
     auto e = GetEnum();
     if (e)
-        return "enum class " + e.GetName();
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return "uint8_t";
 }
 
@@ -1508,9 +1520,13 @@ UE_UEnum UE_FEnumProperty::GetEnum() const
 
 std::string UE_FEnumProperty::GetTypeStr() const
 {
-    if (GetEnum())
-        return "enum class " + GetEnum().GetName();
-
+    auto e = GetEnum();
+    if (e)
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return GetUnderlayingProperty().GetType().second;
 }
 

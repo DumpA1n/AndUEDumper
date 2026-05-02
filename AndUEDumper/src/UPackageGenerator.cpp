@@ -1,5 +1,8 @@
 #include "UPackageGenerator.hpp"
 
+#include <cctype>
+#include <unordered_set>
+
 #include "UE/UEMemory.hpp"
 using namespace UEMemory;
 
@@ -41,6 +44,140 @@ void UE_UPackage::FillPadding(const UE_UStruct &object, std::vector<Member> &mem
     }
 }
 
+// Replace characters that aren't valid in C++ identifiers with '_'. Real
+// dumps contain UE class names like `UFoo~Bar` and `UBaz-Qux` (auto-named
+// blueprint subclasses). Structural punctuation that legitimately appears
+// in our type strings — '<>', ',', '*', '&', ':', '[]', whitespace — is
+// preserved so templates and bit-field markers stay parseable.
+static std::string SanitizeForCpp(const std::string &in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        const bool keep = std::isalnum(uc) || c == '_'
+                       || c == ' ' || c == '\t'
+                       || c == '<' || c == '>' || c == ','
+                       || c == '*' || c == '&'
+                       || c == ':'
+                       || c == '[' || c == ']';
+        out += keep ? c : '_';
+    }
+    return out;
+}
+
+// Stricter sanitizer for pure-identifier positions: struct / enum / member /
+// function names that come from an FName and may contain spaces or any
+// other non-identifier byte. Anything outside [A-Za-z0-9_] becomes '_'.
+static std::string SanitizeIdentifier(const std::string &in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        out += (std::isalnum(uc) || c == '_') ? c : '_';
+    }
+    return out;
+}
+
+// Identifiers that come from primitive C++ types or the AIOHeader preamble
+// (predefined containers, smart pointers, basic UE types). Members of this
+// set never become package-level dependencies.
+static const std::unordered_set<std::string> &kBuiltinIdents()
+{
+    static const std::unordered_set<std::string> s = {
+        // C++ primitives / qualifiers
+        "void", "bool", "char", "short", "int", "long", "float", "double",
+        "signed", "unsigned",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "size_t", "ptrdiff_t", "intptr_t", "uintptr_t",
+        // C++ keywords that may appear via "struct"/"enum class"/"const" prefixes
+        "struct", "enum", "class", "const", "volatile",
+        // Basic UE types provided by the AIOHeader preamble
+        "FName", "FString", "FText",
+        "FScriptDelegate", "FDelegate", "FMulticastDelegate",
+        "FMulticastInlineDelegate", "FMulticastSparseDelegate",
+        "FWeakObjectPtr", "FUniqueObjectGuid", "FFieldClass", "FProperty",
+        "FScriptInterface", "FFieldPath",
+        // Predefined container / wrapper templates
+        "TArray", "TMap", "TSet", "TPair",
+        "TWeakObjectPtr", "TLazyObjectPtr",
+        "TSoftObjectPtr", "TSoftClassPtr",
+        "TSubclassOf", "TScriptInterface", "TFieldPath",
+        // Sentinel emitted by the dumper for malformed/unknown children —
+        // forward-declared in the AIOHeader preamble so containers compile.
+        "None", "FNone",
+    };
+    return s;
+}
+
+// Templates whose stored data is a pointer/handle to T — therefore a forward
+// declaration of T is sufficient for the surrounding struct to be sized.
+static bool IsForwardDeclWrapper(const std::string &ident)
+{
+    static const std::unordered_set<std::string> wrappers = {
+        "TArray", "TMap", "TSet", "TPair",
+        "TWeakObjectPtr", "TLazyObjectPtr",
+        "TSoftObjectPtr", "TSoftClassPtr",
+        "TSubclassOf", "TScriptInterface", "TFieldPath",
+    };
+    return wrappers.count(ident) != 0;
+}
+
+void UE_UPackage::ExtractTypeDeps(const std::string &typeStr,
+                                  std::set<std::string> &fullDeps,
+                                  std::set<std::string> &fwdDeps)
+{
+    const auto &builtins = kBuiltinIdents();
+
+    int templateDepth = 0;
+    size_t i = 0;
+    const size_t n = typeStr.size();
+
+    while (i < n)
+    {
+        char c = typeStr[i];
+        if (c == '<') { templateDepth++; i++; continue; }
+        if (c == '>') { templateDepth--; i++; continue; }
+
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
+        {
+            size_t start = i;
+            while (i < n && (std::isalnum(static_cast<unsigned char>(typeStr[i])) || typeStr[i] == '_'))
+                i++;
+            std::string ident = typeStr.substr(start, i - start);
+
+            // Skip whitespace looking for the next significant char
+            size_t j = i;
+            while (j < n && std::isspace(static_cast<unsigned char>(typeStr[j])))
+                j++;
+            const bool isPointer = (j < n && typeStr[j] == '*');
+
+            if (builtins.count(ident))
+                continue;
+
+            // Wrapper template names themselves don't add dependencies — we
+            // walk into their template arguments via the regular loop.
+            if (IsForwardDeclWrapper(ident))
+                continue;
+
+            // Inside <>: stored as pointer/handle by the wrapper, so a
+            // forward decl is enough. Outside <> with explicit '*' too.
+            if (templateDepth > 0 || isPointer)
+                fwdDeps.insert(std::move(ident));
+            else
+                fullDeps.insert(std::move(ident));
+        }
+        else
+        {
+            i++;
+        }
+    }
+}
+
 void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
 {
     out->Name = fn.GetName();
@@ -58,24 +195,26 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         // if property has 'ReturnParm' flag
         if (flags & CPF_ReturnParm)
         {
-            out->CppName = prop->GetType().second + " " + fn.GetName();
+            out->CppName = SanitizeForCpp(prop->GetType().second) + " " + SanitizeIdentifier(fn.GetName());
         }
         // if property has 'Parm' flag
         else if (flags & CPF_Parm)
         {
+            const std::string typeStr = SanitizeForCpp(prop->GetType().second);
+            const std::string nameStr = SanitizeIdentifier(prop->GetName());
             if (prop->GetArrayDim() > 1)
             {
-                out->Params += fmt::format("{}* {}, ", prop->GetType().second, prop->GetName());
+                out->Params += fmt::format("{}* {}, ", typeStr, nameStr);
             }
             else
             {
                 if (flags & CPF_OutParm)
                 {
-                    out->Params += fmt::format("{}& {}, ", prop->GetType().second, prop->GetName());
+                    out->Params += fmt::format("{}& {}, ", typeStr, nameStr);
                 }
                 else
                 {
-                    out->Params += fmt::format("{} {}, ", prop->GetType().second, prop->GetName());
+                    out->Params += fmt::format("{} {}, ", typeStr, nameStr);
                 }
             }
         }
@@ -98,7 +237,7 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
 
     if (out->CppName.size() == 0)
     {
-        out->CppName = "void " + fn.GetName();
+        out->CppName = "void " + SanitizeIdentifier(fn.GetName());
     }
 }
 
@@ -108,8 +247,9 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     s.Name = object.GetName();
     s.FullName = object.GetFullName();
 
+    s.CppNameOnly = SanitizeIdentifier(object.GetCppName());
     s.CppName = "struct ";
-    s.CppName += object.GetCppName();
+    s.CppName += s.CppNameOnly;
 
     s.Inherited = 0;
     s.Size = object.GetSize();
@@ -123,9 +263,12 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     auto super = object.GetSuper();
     if (super)
     {
+        s.SuperCppName = SanitizeIdentifier(super.GetCppName());
         s.CppName += " : ";
-        s.CppName += super.GetCppName();
+        s.CppName += s.SuperCppName;
         s.Inherited = super.GetSize();
+        // Inheriting requires the complete super type
+        s.FullDeps.insert(s.SuperCppName);
     }
 
     uint32_t offset = s.Inherited;
@@ -141,9 +284,32 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         }  // this shouldn't be zero
 
         auto type = prop->GetType();
-        m->Type = type.second;
-        m->Name = prop->GetName();
+        m->Type = SanitizeForCpp(type.second);
+        m->Name = SanitizeIdentifier(prop->GetName());
         m->Offset = prop->GetOffset();
+
+        // Unknown property types come back with a placeholder name (often
+        // "None"/"ENone") whose definition would never compile. Replace
+        // the type with an opaque byte buffer matching the dumped size —
+        // readers still get correct offsets, just no field-typed access.
+        if (type.first == UEPropertyType::Unknown
+            || m->Type.empty()
+            || m->Type == "None"
+            || m->Type == "ENone")
+        {
+            if (m->Size <= 1)
+            {
+                m->Type = "uint8_t";
+            }
+            else
+            {
+                m->Type = "uint8_t";
+                m->Name += fmt::format("[0x{:X}]", m->Size);
+            }
+        }
+
+        // Track which other dumped types this member references
+        ExtractTypeDeps(m->Type, s.FullDeps, s.ForwardDeps);
 
         if (m->Offset > offset)
         {
@@ -164,21 +330,31 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
                 mask >>= 1;
                 ones++;
             }
-            if (zeros > bitOffset)
+            if (ones == 0)
             {
-                UE_UPackage::GenerateBitPadding(s.Members, offset, bitOffset, zeros - bitOffset);
-                bitOffset = zeros;
+                // Mask was zero (or unrecognised). C++ rejects a named
+                // zero-width bit-field, so fall back to a full byte.
+                offset += m->Size;
+                m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
             }
-            m->Name += fmt::format(" : {}", ones);
-            bitOffset += ones;
-
-            if (bitOffset == 8)
+            else
             {
-                offset++;
-                bitOffset = 0;
-            }
+                if (zeros > bitOffset)
+                {
+                    UE_UPackage::GenerateBitPadding(s.Members, offset, bitOffset, zeros - bitOffset);
+                    bitOffset = zeros;
+                }
+                m->Name += fmt::format(" : {}", ones);
+                bitOffset += ones;
 
-            m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
+                if (bitOffset == 8)
+                {
+                    offset++;
+                    bitOffset = 0;
+                }
+
+                m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
+            }
         }
         else
         {
@@ -206,6 +382,12 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             auto fn = child.Cast<UE_UFunction>();
             Function f;
             GenerateFunction(fn, &f);
+            // Function param/return types reference other types but only
+            // through value/reference parameters in declarations — these
+            // can use forward declarations because the function body lives
+            // outside this header.
+            ExtractTypeDeps(f.CppName, s.ForwardDeps, s.ForwardDeps);
+            ExtractTypeDeps(f.Params, s.ForwardDeps, s.ForwardDeps);
             s.Functions.push_back(f);
         }
         else if (child.IsA<UE_UProperty>())
@@ -223,6 +405,11 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         UE_UPackage::FillPadding(object, s.Members, offset, bitOffset, s.Size);
     }
 
+    // Self-references in templated members (e.g., TArray<FFoo>) must not
+    // make the struct depend on itself.
+    s.FullDeps.erase(s.CppNameOnly);
+    s.ForwardDeps.erase(s.CppNameOnly);
+
     arr.push_back(s);
 }
 
@@ -237,6 +424,7 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
     auto names = object.GetNames();
     uint64_t max = 0;
 
+    std::unordered_set<std::string> seenEnumNames;
     for (int32_t i = 0; i < names.Num(); i++)
     {
         auto pair = names.GetData() + i * pairSize;
@@ -250,7 +438,14 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
         if (value > max)
             max = value;
 
-        e.Members.emplace_back(str, value);
+        std::string sanitized = SanitizeIdentifier(str);
+        // UE reflection occasionally exposes duplicate enumerator names within
+        // the same enum (different underlying values). C++ would reject the
+        // redefinition, so we drop later occurrences.
+        if (!seenEnumNames.insert(sanitized).second)
+            continue;
+
+        e.Members.emplace_back(std::move(sanitized), value);
     }
 
     // enum values should be in ascending order
@@ -276,18 +471,17 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
         }
     }
 
-    const char *type = nullptr;
-
     if (max > GetMaxOfType<uint32_t>())
-        type = " : uint64_t";
+        e.UnderlyingType = "uint64_t";
     else if (max > GetMaxOfType<uint16_t>())
-        type = " : uint32_t";
+        e.UnderlyingType = "uint32_t";
     else if (max > GetMaxOfType<uint8_t>())
-        type = " : uint16_t";
+        e.UnderlyingType = "uint16_t";
     else
-        type = " : uint8_t";
+        e.UnderlyingType = "uint8_t";
 
-    e.CppName = "enum class " + object.GetName() + type;
+    e.CppNameOnly = SanitizeIdentifier(object.GetName());
+    e.CppName = "enum class " + e.CppNameOnly + " : " + e.UnderlyingType;
 
     if (e.Members.size())
     {
@@ -350,6 +544,7 @@ void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt
 
 void UE_UPackage::Process()
 {
+    PackageName = GetObject().GetName();
     auto &objects = Package->second;
     for (auto &object : objects)
     {
