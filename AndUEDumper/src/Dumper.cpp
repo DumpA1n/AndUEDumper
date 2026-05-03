@@ -2332,15 +2332,21 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("}} // namespace SDK\n");
         ++nonCorePkgCount;
 
-        // ---- 2b. <pkg>_functions.hpp (header-only inline bodies) -----------
+        // ---- 2b. <pkg>_functions.cpp (out-of-line bodies, link-time) -------
         // Bodies need *complete* types (Parms.X member access, memcpy with
         // sizeof). The sibling <pkg>.hpp covers same-package + struct-level
         // FullDeps; we additionally collect every other non-core pkg whose
         // type appears in any function signature, since param types may be
         // forward-decl-only at <pkg>.hpp level.
-        const std::string fnFname = pkgPrefix + pkg.PackageName + "_functions.hpp";
+        //
+        // Emitting bodies as non-inline definitions in a separate .cpp keeps
+        // SDK.hpp itself a pure declaration aggregator. Each consuming TU
+        // pays only for the headers it actually uses; the function bodies
+        // compile once when the user adds Packages/*.cpp + CoreUObject_*.cpp
+        // + Basic.cpp to their build (e.g. via `file(GLOB_RECURSE ... *.cpp)`
+        // in CMake, see misc/sdk_smoke/CMakeLists.txt).
+        const std::string fnFname = pkgPrefix + pkg.PackageName + "_functions.cpp";
         auto &fbuf = outBuffersMap[fnFname];
-        fbuf.append("#pragma once\n\n");
         fbuf.append("#include \"{}.hpp\"\n", pkg.PackageName);
 
         std::set<std::string> fnDepPkgs;
@@ -2368,31 +2374,34 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
             fbuf.append("#include \"{}.hpp\"\n", dp);
         fbuf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
         fbuf.append("namespace SDK\n{{\n\n");
-        EmitPackageFunctionBodies(fbuf, pkg, /*emitInline=*/true, _sdkEnumUnderlying);
+        EmitPackageFunctionBodies(fbuf, pkg, /*emitInline=*/false, _sdkEnumUnderlying);
         fbuf.append("}} // namespace SDK\n");
     }
 
     // ---- 3. SDK.hpp aggregator -------------------------------------------
+    //
+    // Pure declaration aggregator: every Packages/*.hpp transitively. Function
+    // bodies live in Packages/*_functions.cpp and are compiled into the user's
+    // build separately (recommended: `file(GLOB_RECURSE SDK_SRCS SDK_A/*.cpp)`
+    // in CMake — see misc/sdk_smoke/CMakeLists.txt). Avoids the per-TU re-
+    // instantiation cost that header-only inline bodies caused (a 56-second
+    // -fsyntax-only on a single Demo.cpp before this change).
     {
         auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
         sdkBuf.append("#pragma once\n\n");
-        sdkBuf.append("// Aggregator: CoreUObject_classes.hpp + every Packages/*.hpp\n");
-        sdkBuf.append("// then every Packages/*_functions.hpp (bodies need every\n");
-        sdkBuf.append("// declaration in scope first). Link CoreUObject_functions.cpp +\n");
-        sdkBuf.append("// Basic.cpp into your TU(s).\n\n");
+        sdkBuf.append("// Declaration-only aggregator: CoreUObject_classes.hpp + every\n");
+        sdkBuf.append("// Packages/*.hpp. UFunction bodies live in Packages/*_functions.cpp\n");
+        sdkBuf.append("// (out-of-line) and CoreUObject_functions.cpp + Basic.cpp must be\n");
+        sdkBuf.append("// linked into your build. With CMake, glob the *.cpp files under\n");
+        sdkBuf.append("// the SDK_A directory and add them to your target's sources — see\n");
+        sdkBuf.append("// misc/sdk_smoke/CMakeLists.txt in the AndUEProber repo for an\n");
+        sdkBuf.append("// example.\n\n");
         sdkBuf.append("#include \"CoreUObject_classes.hpp\"\n");
         for (size_t pkgIdx : _sdkPkgOrder)
         {
             if (pkgIdx == coreIdx) continue;
             const auto &pkg = _sdkProcessed[pkgIdx];
             sdkBuf.append("#include \"Packages/{}.hpp\"\n", pkg.PackageName);
-        }
-        sdkBuf.append("\n// --- Function bodies (inline, header-only) ---\n");
-        for (size_t pkgIdx : _sdkPkgOrder)
-        {
-            if (pkgIdx == coreIdx) continue;
-            const auto &pkg = _sdkProcessed[pkgIdx];
-            sdkBuf.append("#include \"Packages/{}_functions.hpp\"\n", pkg.PackageName);
         }
     }
 
