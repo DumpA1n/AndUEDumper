@@ -1790,18 +1790,16 @@ static void EmitUFunctionBody(BufferFmt &buf,
 
     const bool hasReturn = (f.ReturnType != "void");
 
-    // For enum types, prefix with `enum class` when used as an elaborated
-    // type specifier in the local Parms struct or in a cast. Two reasons:
-    //  (1) UE occasionally produces parameter names identical to the enum
-    //      type name (e.g. `EaseType EaseType`). Inside the function body
-    //      the parameter shadows the namespace-scope enum, so unqualified
-    //      `EaseType` resolves to the variable. `enum class EaseType` is
-    //      an elaborated specifier that bypasses ordinary lookup.
-    //  (2) The forward decl block in the per-pkg header writes
-    //      `enum class EFoo : ut;` for cross-pkg enums; `enum class EFoo`
-    //      finds it whether the full definition has been seen yet or not.
+    // For enum types, prefix with `enum` (NOT `enum class`) when used as
+    // an elaborated type specifier in the local Parms struct or a cast.
+    // C++ accepts `enum X` to refer to either a scoped or unscoped
+    // enumeration; `enum class X` is only valid in the declaration itself
+    // and clang rejects it as a use-site specifier with
+    // -Welaborated-enum-class. The elaborated form bypasses ordinary
+    // unqualified lookup, which otherwise hits the (shadowing) parameter
+    // name when UE produces things like `EaseType EaseType`.
     auto qualifyType = [&](const std::string &t) -> std::string {
-        return enumUnderlying.count(t) ? "enum class " + t : t;
+        return enumUnderlying.count(t) ? "enum " + t : t;
     };
 
     buf.append("{}{}({})\n{{\n", kw, qualifiedHead, f.Params);
