@@ -2238,6 +2238,23 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
                    pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
 
+        // Forward declarations for every struct/class in this package.
+        // Same-package types referenced through pointer or pointer-handle
+        // wrappers (e.g. `TSoftObjectPtr<USkeletalMesh>` at offset N when
+        // `struct USkeletalMesh` is defined later in the file) only need a
+        // declaration in scope; without this block the use site fails with
+        // "unknown type name". Same-package value-holding usages still rely
+        // on definition order during AppendStructsToBuffer below, which the
+        // dumper already topologically sorts.
+        if (!pkg.Structures.empty() || !pkg.Classes.empty())
+        {
+            for (const auto &s : pkg.Structures)
+                buf.append("struct {};\n", s.CppNameOnly);
+            for (const auto &c : pkg.Classes)
+                buf.append("struct {};\n", c.CppNameOnly);
+            buf.append("\n");
+        }
+
         if (!pkg.Enums.empty())      UE_UPackage::AppendEnumsToBuffer(pkg.Enums, &buf);
         if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &buf);
         if (!pkg.Classes.empty())    UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
