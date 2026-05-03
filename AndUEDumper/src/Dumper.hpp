@@ -101,35 +101,15 @@ private:
     // share one pass.
     void BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback);
 
-    // Emit AIOHeader.hpp under SDK_B/. Types-only monolith — preamble and
-    // ProcessEvent bodies have moved into the surrounding SDK_B/ split
-    // (CoreUObject_classes.hpp + per-pkg _functions.cpp). The aggregator
-    // SDK_B/SDK.hpp pulls this header alongside CoreUObject_classes.hpp.
-    void DumpAIOHeader(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap);
+    void DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt);
 
     // Plan A: per-package single .hpp + Basic.hpp + SDK.hpp aggregator.
     // Inserts entries with prefixed paths (e.g. "SDK_A/Basic.hpp") into
     // outBuffersMap.
     void DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap);
 
-    // Plan B: UECore-style root files + AIOHeader.hpp (all-types monolith)
-    // + Packages/<pkg>_functions.cpp (out-of-line bodies). Shares the
-    // _functions.cpp emission pipeline with Plan A via EmitPackageFunctionsCpp.
+    // Plan B: UECore-style 4-file split per package
+    // (<pkg>_classes.hpp / _structs.hpp / _parameters.hpp / _functions.cpp)
+    // plus shared Basic.hpp + UnrealContainers.hpp + SDK.hpp aggregator.
     void DumpSDK_UECoreStyle(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap);
-
-    // Emit a single <pkg>_functions.cpp containing out-of-line ProcessEvent
-    // dispatch bodies for every UFunction in pkg. headerInclude is the path
-    // (relative to the .cpp's location) of the header that declares pkg's
-    // types — for Plan A that's the sibling "<pkg>.hpp", for Plan B it's
-    // "../AIOHeader.hpp". emitCrossPkgIncludes adds `#include "<dep>.hpp"`
-    // for cross-pkg deps that appear in function signatures (Plan A only;
-    // Plan B's AIOHeader already aggregates everything).
-    void EmitPackageFunctionsCpp(
-        const std::string &filePath,
-        const UE_UPackage &pkg,
-        size_t pkgIdx,
-        size_t coreIdx,
-        const std::string &headerInclude,
-        bool emitCrossPkgIncludes,
-        std::unordered_map<std::string, BufferFmt> &outBuffersMap);
 };
