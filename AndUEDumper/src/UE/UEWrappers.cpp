@@ -1181,6 +1181,7 @@ UEPropTypeInfo UE_FProperty::GetType() const
         break;
     }
     case HASH("ObjectProperty"):
+    case HASH("ObjectPtrProperty"):
     {
         auto obj = this->Cast<UE_FObjectPropertyBase>();
         type = {UEPropertyType::ObjectProperty, obj.GetTypeStr()};
