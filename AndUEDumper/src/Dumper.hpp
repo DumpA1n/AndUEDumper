@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "UE/UEGameProfile.hpp"
@@ -51,6 +52,7 @@ private:
     // DumpSDK_UECoreStyle. Cleared at the top of each Dump().
     std::vector<UE_UPackage> _sdkProcessed;
     std::unordered_map<std::string, size_t> _sdkNameToPkg;
+    std::unordered_set<std::string> _sdkEnumNames;
     std::vector<size_t> _sdkPkgOrder;
     std::set<std::string> _sdkPhantomEnums;
     std::set<std::string> _sdkPhantomStructs;

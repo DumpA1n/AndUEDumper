@@ -682,6 +682,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 {
     _sdkProcessed.clear();
     _sdkNameToPkg.clear();
+    _sdkEnumNames.clear();
     _sdkPkgOrder.clear();
     _sdkPhantomEnums.clear();
     _sdkPhantomStructs.clear();
@@ -1200,7 +1201,40 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
     {
         for (const auto &s : _sdkProcessed[i].Structures) registerType(s.CppNameOnly, i);
         for (const auto &c : _sdkProcessed[i].Classes)    registerType(c.CppNameOnly, i);
-        for (const auto &e : _sdkProcessed[i].Enums)      registerType(e.CppNameOnly, i);
+        for (const auto &e : _sdkProcessed[i].Enums)
+        {
+            registerType(e.CppNameOnly, i);
+            _sdkEnumNames.insert(e.CppNameOnly);
+        }
+    }
+
+    // ---- Phase 2.5: promote enum ForwardDeps -> FullDeps ---------------------
+    //
+    // ExtractTypeDeps treats `TArray<EFoo>` / `TMap<K, EFoo>` (PtrHandle outer
+    // wrapper) as a forward-decl-only ref to EFoo. That works for class types
+    // but not for enums: a C++ forward declaration of an enum requires the
+    // underlying type, which we don't carry to the use site, and even then a
+    // sized member can't be declared from `enum class EFoo : uint8_t;` alone.
+    // Promote any enum-typed ForwardDep so the cross-pkg #include collector
+    // pulls the defining package's .hpp.
+    for (auto &pkg : _sdkProcessed)
+    {
+        auto reclassify = [&](UE_UPackage::Struct &s) {
+            for (auto it = s.ForwardDeps.begin(); it != s.ForwardDeps.end();)
+            {
+                if (_sdkEnumNames.count(*it))
+                {
+                    s.FullDeps.insert(*it);
+                    it = s.ForwardDeps.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        };
+        for (auto &s : pkg.Structures) reclassify(s);
+        for (auto &c : pkg.Classes)    reclassify(c);
     }
 
     // ---- Phase 3: build inter-package dependency graph -----------------------
@@ -2219,30 +2253,40 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         // UnrealContainers.h, giving us UObject + every dumped CoreUObject type.
         buf.append("#include \"../CoreUObject_classes.hpp\"\n");
 
-        // Cross-pkg deps: every other non-core pkg this pkg depends on.
-        // Both FullDeps and ForwardDeps drive #include emission. ForwardDeps
-        // for *same-package* types are satisfied by the forward-decl block
-        // emitted just below the namespace open, but ForwardDeps for
-        // *cross-package* types have no other landing spot — without an
-        // include we'd need a typed forward decl, which doesn't work for
-        // enums (no underlying type info at use site) and pulls layout risk
-        // for class hierarchies. Including the source pkg's .hpp is simpler
-        // and keeps the surrounding `TSoftObjectPtr<X>` / `TArray<X>` /
-        // function-signature usages compilable.
+        // Cross-pkg dep emission strategy:
+        //   FullDeps    -> #include source pkg's .hpp. FullDeps form a DAG
+        //                  (Phase 3 tops-sorts on them), so no #include
+        //                  cycles.
+        //   ForwardDeps -> emit `struct X;` forward decl in this pkg's
+        //                  namespace SDK. Does NOT trigger #include because
+        //                  ForwardDeps frequently form cycles (UE Engine
+        //                  forward-references UMG, UMG forward-references
+        //                  Engine), and #include + #pragma once + cycles
+        //                  produces partial-header inclusion bugs.
+        //   Enums in ForwardDeps were promoted to FullDeps in Phase 2.5 —
+        //   a `struct EFoo;` forward decl is invalid for an `enum class`
+        //   and even if we emitted `enum class EFoo : uint8_t;` we'd need
+        //   the underlying type at the use site.
         std::set<std::string> depPkgs;
+        std::set<std::string> crossPkgFwdDecls;
         auto collect = [&](const UE_UPackage::Struct &s) {
-            auto record = [&](const std::set<std::string> &deps) {
-                for (const auto &dep : deps)
-                {
-                    auto it = _sdkNameToPkg.find(dep);
-                    if (it == _sdkNameToPkg.end()) continue;
-                    if (it->second == pkgIdx) continue;
-                    if (it->second == coreIdx) continue; // already pulled via CoreUObject_classes
-                    depPkgs.insert(_sdkProcessed[it->second].PackageName);
-                }
-            };
-            record(s.FullDeps);
-            record(s.ForwardDeps);
+            for (const auto &dep : s.FullDeps)
+            {
+                auto it = _sdkNameToPkg.find(dep);
+                if (it == _sdkNameToPkg.end()) continue;
+                if (it->second == pkgIdx) continue;
+                if (it->second == coreIdx) continue; // pulled via CoreUObject_classes
+                depPkgs.insert(_sdkProcessed[it->second].PackageName);
+            }
+            for (const auto &dep : s.ForwardDeps)
+            {
+                auto it = _sdkNameToPkg.find(dep);
+                if (it == _sdkNameToPkg.end()) continue;
+                if (it->second == pkgIdx) continue;        // covered by same-pkg fwd block
+                if (it->second == coreIdx) continue;        // CoreUObject types already complete
+                if (_sdkEnumNames.count(dep)) continue;     // enums were promoted to FullDeps
+                crossPkgFwdDecls.insert(dep);
+            }
         };
         for (const auto &s : pkg.Structures) collect(s);
         for (const auto &c : pkg.Classes)    collect(c);
@@ -2254,16 +2298,17 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
                    pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
 
-        // Forward declarations for every struct/class in this package.
-        // Same-package types referenced through pointer or pointer-handle
-        // wrappers (e.g. `TSoftObjectPtr<USkeletalMesh>` at offset N when
-        // `struct USkeletalMesh` is defined later in the file) only need a
-        // declaration in scope; without this block the use site fails with
-        // "unknown type name". Same-package value-holding usages still rely
-        // on definition order during AppendStructsToBuffer below, which the
-        // dumper already topologically sorts.
-        if (!pkg.Structures.empty() || !pkg.Classes.empty())
+        // Forward decl block. Covers:
+        //   (a) Same-package types — needed because struct/class definitions
+        //       within this file are output in topological order on FullDeps,
+        //       but pointer/handle wrapper refs from earlier defs to later
+        //       defs would otherwise see "unknown type name".
+        //   (b) Cross-package pointer-only refs — a forward decl is enough,
+        //       and avoids #include cycles (see strategy comment above).
+        if (!pkg.Structures.empty() || !pkg.Classes.empty() || !crossPkgFwdDecls.empty())
         {
+            for (const auto &n : crossPkgFwdDecls)
+                buf.append("struct {};\n", n);
             for (const auto &s : pkg.Structures)
                 buf.append("struct {};\n", s.CppNameOnly);
             for (const auto &c : pkg.Classes)
