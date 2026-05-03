@@ -2220,16 +2220,29 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("#include \"../CoreUObject_classes.hpp\"\n");
 
         // Cross-pkg deps: every other non-core pkg this pkg depends on.
+        // Both FullDeps and ForwardDeps drive #include emission. ForwardDeps
+        // for *same-package* types are satisfied by the forward-decl block
+        // emitted just below the namespace open, but ForwardDeps for
+        // *cross-package* types have no other landing spot — without an
+        // include we'd need a typed forward decl, which doesn't work for
+        // enums (no underlying type info at use site) and pulls layout risk
+        // for class hierarchies. Including the source pkg's .hpp is simpler
+        // and keeps the surrounding `TSoftObjectPtr<X>` / `TArray<X>` /
+        // function-signature usages compilable.
         std::set<std::string> depPkgs;
         auto collect = [&](const UE_UPackage::Struct &s) {
-            for (const auto &dep : s.FullDeps)
-            {
-                auto it = _sdkNameToPkg.find(dep);
-                if (it == _sdkNameToPkg.end()) continue;
-                if (it->second == pkgIdx) continue;
-                if (it->second == coreIdx) continue; // already pulled via CoreUObject_classes
-                depPkgs.insert(_sdkProcessed[it->second].PackageName);
-            }
+            auto record = [&](const std::set<std::string> &deps) {
+                for (const auto &dep : deps)
+                {
+                    auto it = _sdkNameToPkg.find(dep);
+                    if (it == _sdkNameToPkg.end()) continue;
+                    if (it->second == pkgIdx) continue;
+                    if (it->second == coreIdx) continue; // already pulled via CoreUObject_classes
+                    depPkgs.insert(_sdkProcessed[it->second].PackageName);
+                }
+            };
+            record(s.FullDeps);
+            record(s.ForwardDeps);
         };
         for (const auto &s : pkg.Structures) collect(s);
         for (const auto &c : pkg.Classes)    collect(c);
