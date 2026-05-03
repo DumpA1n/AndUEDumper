@@ -1944,6 +1944,21 @@ static std::string ApplyCasePreservingDefine(std::string content, bool casePrese
     return content;
 }
 
+// Re-target Basic.cpp's `#include "CoreUObject_classes.h"` to the .hpp
+// extension the dumper actually emits. Source side keeps the .h spelling
+// because it neighbours the prober runtime header at
+// source/UEProber/UECore/CoreUObject_classes.h, but the SDK output only
+// has CoreUObject_classes.hpp.
+static std::string RetargetBasicCppIncludes(std::string content)
+{
+    const std::string from = "#include \"CoreUObject_classes.h\"";
+    const std::string to   = "#include \"CoreUObject_classes.hpp\"";
+    auto pos = content.find(from);
+    if (pos != std::string::npos)
+        content.replace(pos, from.size(), to);
+    return content;
+}
+
 // ============================================================================
 //  EmitSDKCoreFiles — shared core-file emit for SDK_A and SDK_B.
 //
@@ -1977,7 +1992,8 @@ static void EmitSDKCoreFiles(
     // output is included in a TU.
     outBuffersMap[prefix + "Basic.h"].append("{}",
         StripUtf8Bom(ApplyCasePreservingDefine(kUECoreBasicH, casePreserving)));
-    outBuffersMap[prefix + "Basic.cpp"].append("{}", StripUtf8Bom(kUECoreBasicCpp));
+    outBuffersMap[prefix + "Basic.cpp"].append("{}",
+        RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
 
     // utfcpp dependency: UnrealContainers.h's FString::ToString uses
