@@ -181,7 +181,7 @@ public:
 		return reinterpret_cast<uint8*>(ObjPtr);
 	};
 
-	int32                                         NumElementsPerChunk = 0x10000;
+	static inline int32                           NumElementsPerChunk = 0x10000;
 
 	struct FUObjectItem**                         Objects;                                           // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
 	uint8                                         Pad_8[0x8];                                        // 0x0008(0x0008)(Fixing Size After Last Property [ Dumper-7 ])
