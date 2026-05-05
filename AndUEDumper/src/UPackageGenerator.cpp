@@ -603,39 +603,60 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
 
 void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBufFmt)
 {
+    auto trimNl = [](std::string s) {
+        while (!s.empty() && s.back() == '\n') s.pop_back();
+        return s;
+    };
+
     for (auto &s : arr)
     {
         pBufFmt->append("// Object: {}\n// Size: 0x{:X} (Inherited: 0x{:X})\n{}\n{{",
                         s.FullName, s.Size, s.Inherited, s.CppName);
 
+        // Build segments first; emit them with a single blank line between
+        // adjacent segments so layout stays uniform regardless of which
+        // segments are populated.
+        std::vector<std::string> segs;
+
+        if (!s.PrefixDecls.empty())
+            segs.push_back(trimNl(s.PrefixDecls));
+
         if (s.Members.size())
         {
+            std::string seg;
             for (auto &m : s.Members)
             {
-                pBufFmt->append("\n\t{} {}; // 0x{:X}(0x{:X})", m.Type, m.Name, m.Offset, m.Size);
+                if (!seg.empty()) seg += "\n";
+                seg += fmt::format("\t{} {}; // 0x{:X}(0x{:X})", m.Type, m.Name, m.Offset, m.Size);
                 if (!m.extra.empty())
-                {
-                    pBufFmt->append(", {}", m.extra);
-                }
+                    seg += fmt::format(", {}", m.extra);
             }
+            segs.push_back(std::move(seg));
         }
+
         if (s.Functions.size())
         {
-            if (s.Members.size())
-                pBufFmt->append("\n");
-
+            std::string seg;
             for (auto &f : s.Functions)
             {
+                if (!seg.empty()) seg += "\n\n";
                 void *funcOffset = f.Func ? (void *)(f.Func - UEWrappers::GetUEVars()->GetBaseAddress()) : nullptr;
-                pBufFmt->append("\n\n\t// Object: {}\n\t// Flags: [{}]\n\t// Offset: {}\n\t// Params: [ Num({}) Size(0x{:X}) ]\n\t{}({});", f.FullName, f.Flags, funcOffset, f.NumParams, f.ParamSize, f.CppName, f.Params);
+                seg += fmt::format("\t// Object: {}\n\t// Flags: [{}]\n\t// Offset: {}\n\t// Params: [ Num({}) Size(0x{:X}) ]\n\t{}({});",
+                                   f.FullName, f.Flags, funcOffset, f.NumParams, f.ParamSize, f.CppName, f.Params);
             }
+            segs.push_back(std::move(seg));
         }
+
         if (!s.ExtraDecls.empty())
+            segs.push_back(trimNl(s.ExtraDecls));
+
+        for (size_t i = 0; i < segs.size(); ++i)
         {
-            if (s.Members.size() || s.Functions.size())
+            pBufFmt->append("\n{}", segs[i]);
+            if (i + 1 < segs.size())
                 pBufFmt->append("\n");
-            pBufFmt->append("{}", s.ExtraDecls);
         }
+
         pBufFmt->append("\n}};\n\n");
     }
 }

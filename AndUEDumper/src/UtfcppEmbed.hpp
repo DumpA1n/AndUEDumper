@@ -1,12 +1,5 @@
 #pragma once
 
-// Auto-embedded copies of external/AndUEDumper/deps/utfcpp/{core.h,unchecked.h}.
-// DumpSDK_PerPackage / DumpSDK_UECoreStyle write these out under SDK_*/utfcpp/
-// so the dumped UnrealContainers.h (which #includes "utfcpp/unchecked.h" on
-// GCC/Clang for UTF-8 <-> UTF-16 conversion in FString) resolves out of the box.
-//
-// Treat as binary — do not edit by hand.
-
 static const char* kUtfcppCoreH = R"UtfcppCore(
 // Copyright 2006 Nemanja Trifunovic
 

@@ -66,6 +66,10 @@ public:
         // (after Members and Functions). Used by the AIOCore augmenter to
         // inject inline method declarations on core reflection types.
         std::string ExtraDecls;
+        // Optional extra C++ source appended verbatim inside the struct body
+        // before Members. Holds DEFINE_UE_CLASS_HELPERS on every Class and
+        // UObject::GObjects on UObject itself.
+        std::string PrefixDecls;
     };
     struct Enum
     {

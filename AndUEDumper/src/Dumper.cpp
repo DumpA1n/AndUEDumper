@@ -651,10 +651,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 // (full enum class with explicit uint64 underlying type), so
                 // the member declaration plus `EClassCastFlags{}` default
                 // arg both work standalone in SDK_A.
+                s.PrefixDecls = "\tstatic inline class TUObjectArrayWrapper GObjects;\n";
                 s.ExtraDecls =
-                    "\t// === AIO Core helpers (out-of-line bodies in CoreUObject_functions.cpp) ===\n"
-                    "\tstatic inline class TUObjectArrayWrapper GObjects;\n"
-                    "\n"
                     "\tvoid ProcessEvent(struct UFunction* Function, void* Parms) const;\n"
                     "\n"
                     "\tstd::string GetName() const;\n"
@@ -707,15 +705,13 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         // / GetDefaultObj() pair that resolves through StaticClassImpl<>
         // (UE-name -> UClass*) and reads the augmented UClass::DefaultObject
         // member. UScriptStructs (Structures) are skipped — they have no
-        // associated UClass. Runs after augment() so the macro lands at the
-        // bottom of UObject's existing helper block (after FindClass etc).
+        // associated UClass. Lands in PrefixDecls so it sits at the top of
+        // the struct body, alongside UObject::GObjects on UObject itself.
         for (auto &p : _sdkProcessed)
         {
             for (auto &c : p.Classes)
             {
-                if (!c.ExtraDecls.empty())
-                    c.ExtraDecls += "\n";
-                c.ExtraDecls += fmt::format(
+                c.PrefixDecls += fmt::format(
                     "\tDEFINE_UE_CLASS_HELPERS({}, \"{}\")\n",
                     c.CppNameOnly, c.Name);
             }
@@ -1470,11 +1466,7 @@ static void EmitSDKCoreFiles(
 
         // Runtime-discovered ProcessEvent vtable index, consumed by
         // UObject::ProcessEvent's body in CoreUObject_functions.cpp.
-        buf.append("#ifdef AIOCORE_PROCESS_EVENT_INDEX\n");
-        buf.append("constexpr int kProcessEventIndex = AIOCORE_PROCESS_EVENT_INDEX;\n");
-        buf.append("#else\n");
-        buf.append("constexpr int kProcessEventIndex = {};\n", processEventIndex);
-        buf.append("#endif\n\n");
+        buf.append("constexpr int kProcessEventIndex = {};\n\n", processEventIndex);
 
         buf.append("// Package: CoreUObject - Classes({})\n\n", corePkg.Classes.size());
 
