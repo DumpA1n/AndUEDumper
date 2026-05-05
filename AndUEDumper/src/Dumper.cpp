@@ -651,6 +651,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 if (s.CppNameOnly == "FVector")
                 {
                     mathOps = R"FVOPS(
+	FVector() = default;
+	FVector(float InX, float InY, float InZ) : X(InX), Y(InY), Z(InZ) {}
 	FVector  operator+(const FVector& o) const { return {X + o.X, Y + o.Y, Z + o.Z}; }
 	FVector  operator-(const FVector& o) const { return {X - o.X, Y - o.Y, Z - o.Z}; }
 	FVector  operator*(const FVector& o) const { return {X * o.X, Y * o.Y, Z * o.Z}; }
@@ -671,11 +673,14 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 	float    Distance(const FVector& o) const  { return (*this - o).Length(); }
 	bool     IsNearlyZero(float t = 1e-4f) const { return std::abs(X) <= t && std::abs(Y) <= t && std::abs(Z) <= t; }
 	FVector  GetSafeNormal(float t = 1e-4f) const { float l = Length(); return l > t ? FVector{X/l, Y/l, Z/l} : FVector{0,0,0}; }
+	std::string ToString() const { char b[64]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f Z=%.3f", X, Y, Z); return std::string(b); }
 )FVOPS";
                 }
                 else if (s.CppNameOnly == "FVector2D")
                 {
                     mathOps = R"FV2OPS(
+	FVector2D() = default;
+	FVector2D(float InX, float InY) : X(InX), Y(InY) {}
 	FVector2D  operator+(const FVector2D& o) const { return {X + o.X, Y + o.Y}; }
 	FVector2D  operator-(const FVector2D& o) const { return {X - o.X, Y - o.Y}; }
 	FVector2D  operator*(const FVector2D& o) const { return {X * o.X, Y * o.Y}; }
@@ -695,11 +700,14 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 	float      Distance(const FVector2D& o) const  { return (*this - o).Length(); }
 	bool       IsNearlyZero(float t = 1e-4f) const { return std::abs(X) <= t && std::abs(Y) <= t; }
 	FVector2D  GetSafeNormal(float t = 1e-4f) const { float l = Length(); return l > t ? FVector2D{X/l, Y/l} : FVector2D{0,0}; }
+	std::string ToString() const { char b[48]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f", X, Y); return std::string(b); }
 )FV2OPS";
                 }
                 else if (s.CppNameOnly == "FVector4")
                 {
                     mathOps = R"FV4OPS(
+	FVector4() = default;
+	FVector4(float InX, float InY, float InZ, float InW) : X(InX), Y(InY), Z(InZ), W(InW) {}
 	FVector4  operator+(const FVector4& o) const { return {X + o.X, Y + o.Y, Z + o.Z, W + o.W}; }
 	FVector4  operator-(const FVector4& o) const { return {X - o.X, Y - o.Y, Z - o.Z, W - o.W}; }
 	FVector4  operator*(float s)           const { return {X * s, Y * s, Z * s, W * s}; }
@@ -715,11 +723,14 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 	float     Length()        const              { return std::sqrt(LengthSquared()); }
 	float     Dot(const FVector4& o) const       { return X*o.X + Y*o.Y + Z*o.Z + W*o.W; }
 	bool      IsNearlyZero(float t = 1e-4f) const{ return std::abs(X) <= t && std::abs(Y) <= t && std::abs(Z) <= t && std::abs(W) <= t; }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f Z=%.3f W=%.3f", X, Y, Z, W); return std::string(b); }
 )FV4OPS";
                 }
                 else if (s.CppNameOnly == "FRotator")
                 {
                     mathOps = R"FROPS(
+	FRotator() = default;
+	FRotator(float InPitch, float InYaw, float InRoll) : Pitch(InPitch), Yaw(InYaw), Roll(InRoll) {}
 	FRotator  operator+(const FRotator& o) const { return {Pitch + o.Pitch, Yaw + o.Yaw, Roll + o.Roll}; }
 	FRotator  operator-(const FRotator& o) const { return {Pitch - o.Pitch, Yaw - o.Yaw, Roll - o.Roll}; }
 	FRotator  operator*(float s)           const { return {Pitch * s, Yaw * s, Roll * s}; }
@@ -732,11 +743,15 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 	bool      operator==(const FRotator& o) const{ return Pitch == o.Pitch && Yaw == o.Yaw && Roll == o.Roll; }
 	bool      operator!=(const FRotator& o) const{ return !(*this == o); }
 	bool      IsNearlyZero(float t = 1e-4f) const{ return std::abs(Pitch) <= t && std::abs(Yaw) <= t && std::abs(Roll) <= t; }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "P=%.3f Y=%.3f R=%.3f", Pitch, Yaw, Roll); return std::string(b); }
 )FROPS";
                 }
                 else if (s.CppNameOnly == "FLinearColor")
                 {
                     mathOps = R"FLCOPS(
+	FLinearColor() = default;
+	FLinearColor(float InR, float InG, float InB, float InA = 1.0f) : R(InR), G(InG), B(InB), A(InA) {}
+	explicit FLinearColor(uint32_t hex) : R(((hex >> 16) & 0xFF) / 255.0f), G(((hex >> 8) & 0xFF) / 255.0f), B((hex & 0xFF) / 255.0f), A(1.0f) {}
 	FLinearColor  operator+(const FLinearColor& o) const { return {R + o.R, G + o.G, B + o.B, A + o.A}; }
 	FLinearColor  operator-(const FLinearColor& o) const { return {R - o.R, G - o.G, B - o.B, A - o.A}; }
 	FLinearColor  operator*(const FLinearColor& o) const { return {R * o.R, G * o.G, B * o.B, A * o.A}; }
@@ -748,6 +763,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 	FLinearColor& operator/=(float s)                    { R /= s; G /= s; B /= s; A /= s; return *this; }
 	bool          operator==(const FLinearColor& o) const{ return R == o.R && G == o.G && B == o.B && A == o.A; }
 	bool          operator!=(const FLinearColor& o) const{ return !(*this == o); }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "R=%.3f G=%.3f B=%.3f A=%.3f", R, G, B, A); return std::string(b); }
 )FLCOPS";
                 }
 
@@ -1217,7 +1233,8 @@ static void EmitSDKCoreFiles(
         buf.append("#pragma once\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"UnrealContainers.h\"\n");
-        buf.append("#include <cmath>\n\n"); // for injected math helpers
+        buf.append("#include <cmath>\n");
+        buf.append("#include <cstdio>\n\n"); // for injected math helpers + ToString
 
         // DEFINE_UE_CLASS_HELPERS macro emitted once here; transitively
         // pulled by _classes.hpp and every Packages/<pkg>.hpp.
