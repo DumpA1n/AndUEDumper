@@ -109,15 +109,9 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
     BufferFmt &aioBufferFmt = outBuffersMap->at("AIOHeader.hpp");
     DumpAIOHeader(logsBufferFmt, aioBufferFmt);
 
-    // SDK_B (UECore-style) was removed — the SDK_B variant only made sense
-    // alongside an AIOHeader that didn't carry its own preamble, and that
-    // refactor caused per-TU memory blow-ups when consuming SDK_B's
-    // monolithic AIOHeader from hundreds of _functions.cpp at once. Plan A
-    // (per-pkg .hpp + .cpp) and the standalone monolithic AIOHeader.hpp
-    // cover both use cases without the cross-product cost.
     if (_sdkMode == SDKMode::Both
         || _sdkMode == SDKMode::OnlyA
-        || _sdkMode == SDKMode::OnlyB) // OnlyB is legacy; treated as OnlyA
+        || _sdkMode == SDKMode::OnlyB) // OnlyB legacy, treated as OnlyA
         DumpSDK_PerPackage(logsBufferFmt, *outBuffersMap);
 
     dumper_jf_ns::base_address = _profile->GetUnrealELF().base();
@@ -347,10 +341,7 @@ void UEDumper::GatherUObjects(BufferFmt &logsBufferFmt, BufferFmt &objsBufferFmt
 }
 
 
-// Topological sort using DFS — produces a "deps first" ordering. For nodes
-// with cycles, we emit them in the order DFS encountered them (this keeps
-// behavior deterministic; callers that need full cycle resolution must
-// supplement with forward declarations).
+// Topological sort (DFS); cycle nodes emit in DFS-encounter order.
 template <typename Node, typename DepsFn>
 static std::vector<Node> TopoSort(const std::vector<Node> &nodes, DepsFn getDeps)
 {
@@ -394,8 +385,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
     auto excludedObjects = _profile->GetExcludedObjects();
 
-    // ---- Phase 1: process every package and collect type metadata ------------
-
     _sdkProcessed.reserve(packages.size());
 
     auto isExcluded = [&excludedObjects](const std::string &fullName)
@@ -431,24 +420,12 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         _sdkProcessed.push_back(std::move(pkg));
     }
 
-    // ---- Phase 1.5: drop preamble-provided names + collapse duplicates -----
-    //
-    // The preamble defines FName/FString/FText, FSoftObjectPath, all wrapper
-    // templates (TArray/TMap/...), and a handful of basic FProperty/FField
-    // helpers. Real UE dumps re-emit some of these as ScriptStructs, so we
-    // skip them here to avoid double definitions.
-    //
-    // Real dumps also produce duplicate names from objects whose FName came
-    // back as "None" (UNone × N) or from games that genuinely contain two
-    // unrelated classes with the same short name. We keep the first
-    // occurrence and drop the rest — references via member type strings
-    // resolve to the surviving one.
+    // Drop preamble-provided names and collapse duplicates (UNone x N etc).
     {
         static const std::unordered_set<std::string> kPreambleProvided = {
             "FName", "FString", "FText",
             "FWeakObjectPtr", "FUniqueObjectGuid",
-            // Note: FSoftObjectPath is NOT skipped — its layout depends on
-            // the per-game FName size, so we let the dump emit the real one.
+            // FSoftObjectPath layout depends on per-game FName size; let dump emit it.
             "FSoftObjectPtr",
             "FScriptInterface", "FFieldPath", "FFieldClass", "FProperty",
             "FScriptDelegate", "FDelegate",
@@ -485,23 +462,9 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         }
     }
 
-    // ---- Phase 1.6: augment well-known core reflection classes ------------
-    //
-    // Property-walker output for UObject / UField / UStruct / UEnum /
-    // UFunction is opaque (`Pad_0xN[0xM]`) because their layouts aren't
-    // expressible through the FProperty graph. The per-game offsets of
-    // their internal slots are already in `UE_Offsets`, so here we stitch
-    // typed members back in, replacing those padding regions.
-    //
-    // Net effect: `Actor->ClassPrivate`, `Func->Func`, `Cls->SuperStruct`
-    // etc. become first-class typed accesses rather than raw byte
-    // arithmetic. For UObject we also inject a `ProcessEvent` declaration;
-    // the inline body is emitted at the very end of the header (Phase 5c)
-    // so it can dispatch through UFunction once the type graph is laid out.
-    //
-    // Runs after Phase 1.5 (so we don't augment structs that are about to
-    // be dropped as duplicates) but before Phase 3 (so the new typed
-    // members feed into the dependency graph).
+    // Augment core reflection classes (UObject/UField/UStruct/UEnum/UFunction/UClass):
+    // stitch typed members back in over the opaque Pad_0xN[] regions the
+    // property walker produces, using offsets from UE_Offsets.
     {
         const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
         const uint32_t fnameSize = static_cast<uint32_t>(offs.FName.Size ? offs.FName.Size : 8);
@@ -520,16 +483,14 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             auto add = [&](uintptr_t off, uint32_t size, std::string type, std::string name,
                            bool allowZeroOffset = false)
             {
-                // Reflected offsets that came back as 0 mean "not discovered" —
-                // skip those slots so we don't smash the start of the struct.
+                // offset 0 = not discovered; skip
                 if (off == 0 && !allowZeroOffset) return;
                 v.push_back({off, size, std::move(type), std::move(name)});
             };
 
             if (cppName == "UObject")
             {
-                // VTable is synthetic: every UObject starts with one but the
-                // dumper has no offset for it. Force-emit at 0.
+                // synthetic vtable slot; dumper has no offset, force-emit at 0
                 add(0,                          8, "void**",           "VTable", true);
                 add(offs.UObject.ClassPrivate,  8, "struct UClass*",   "ClassPrivate");
                 add(offs.UObject.OuterPrivate,  8, "struct UObject*",  "OuterPrivate");
@@ -561,9 +522,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "UClass")
             {
-                // EClassCastFlags is provided by the embedded UECore Basic.h
-                // (namespace SDK, explicit uint64 underlying type), so the
-                // member declaration compiles standalone in SDK_A.
                 add(offs.UClass.CastFlags,     8, "EClassCastFlags", "CastFlags");
                 add(offs.UClass.DefaultObject, 8, "struct UObject*", "DefaultObject");
             }
@@ -578,11 +536,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             std::sort(fields.begin(), fields.end(),
                       [](const KnownField &a, const KnownField &b) { return a.Offset < b.Offset; });
 
-            // Drop fields that fall in the inherited range (already provided
-            // by the parent struct) or extend past this struct's reflected
-            // size. Without this guard a malformed offset (e.g. 0 reported
-            // for a slot that's actually inside the parent) would smash the
-            // member layout.
+            // drop fields inside inherited range or past struct size
             fields.erase(
                 std::remove_if(fields.begin(), fields.end(),
                                [&](const KnownField &f) {
@@ -626,8 +580,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 rebuilt.push_back(std::move(pad));
             }
 
-            // ExtractTypeDeps may have re-introduced self as a dep (e.g.
-            // UObject's OuterPrivate references UObject); strip it.
+            // strip self-reference re-added by ExtractTypeDeps
             s.FullDeps.erase(s.CppNameOnly);
             s.ForwardDeps.erase(s.CppNameOnly);
 
@@ -635,22 +588,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
             if (s.CppNameOnly == "UObject")
             {
-                // === AIO Core helpers (inline bodies at end of header) ===
-                //
-                // ProcessEvent dispatches via vtable[ProcessEventIndex]; the
-                // rest walk the typed members added above (ClassPrivate /
-                // OuterPrivate / NamePrivate / ObjectFlags) plus
-                // UStruct::SuperStruct (added when UStruct is augmented in
-                // this same pass) and UClass::{CastFlags,DefaultObject}.
-                // GetName / Name lookup goes through FName::s_NameResolver
-                // (game-specific, FName pool can be encrypted). Object
-                // lookup (FindObject*, FindClass*) walks GObjects directly
-                // — wire via UObject::GObjects.InitManually(addr) once.
-                //
-                // EClassCastFlags is provided by the embedded UECore Basic.h
-                // (full enum class with explicit uint64 underlying type), so
-                // the member declaration plus `EClassCastFlags{}` default
-                // arg both work standalone in SDK_A.
                 s.PrefixDecls = "\tstatic inline class TUObjectArrayWrapper GObjects;\n";
                 s.ExtraDecls =
                     "\tvoid ProcessEvent(struct UFunction* Function, void* Parms) const;\n"
@@ -681,12 +618,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (s.CppNameOnly == "UClass")
             {
-                // Lookup helper used by every emitted UFunction body's
-                // ProcessEvent dispatch:
-                //     ClassPrivate->GetFunction("Owner", "FuncName")
-                // Walks SuperStruct + Children, matched by Function-cast flag
-                // (EClassCastFlags{0x80000}) and FName equality. Body emitted
-                // inline in AIOHeader / out-of-line in CoreUObject_functions.cpp.
                 s.ExtraDecls =
                     "\tstruct UFunction* GetFunction(const std::string& ClassName, "
                     "const std::string& FuncName) const;\n";
@@ -699,14 +630,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             for (auto &s : p.Structures) augment(s); // harmless on non-targets
         }
 
-        // ---- Phase 1.6b: emit DEFINE_UE_CLASS_HELPERS on every Class ----
-        //
-        // For each dumped UClass-derived type, append a static StaticClass()
-        // / GetDefaultObj() pair that resolves through StaticClassImpl<>
-        // (UE-name -> UClass*) and reads the augmented UClass::DefaultObject
-        // member. UScriptStructs (Structures) are skipped — they have no
-        // associated UClass. Lands in PrefixDecls so it sits at the top of
-        // the struct body, alongside UObject::GObjects on UObject itself.
+        // Emit DEFINE_UE_CLASS_HELPERS on every Class (skips ScriptStructs).
         for (auto &p : _sdkProcessed)
         {
             for (auto &c : p.Classes)
@@ -717,20 +641,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
         }
 
-        // ---- Phase 1.6c: math operators on well-known math structs ----
-        //
-        // Inject member operators (+ - * / +=  -= *= /= == != unary-)
-        // and helper methods (Length / LengthSquared / Dot / Cross /
-        // Distance / IsNearlyZero / GetSafeNormal) on the canonical UE
-        // math types. All emitted member-scoped (T::operator+, ...) so
-        // they don't leak into namespace SDK and can't conflict with
-        // anything else the user pulls in. Not gated by a macro — the
-        // imgui IMGUI_DEFINE_MATH_OPERATORS pattern guards free-function
-        // operators, which is irrelevant once everything is on the type.
-        //
-        // Component-wise operations + the Length family assume the
-        // canonical UE member layout (X/Y/Z, Pitch/Yaw/Roll, R/G/B/A);
-        // games that re-shape these structs would need to override.
+        // Inject math operators + helpers on canonical UE math structs.
+        // Member-scoped so they can't collide with user code.
         for (auto &p : _sdkProcessed)
         {
             for (auto &s : p.Structures)
@@ -739,7 +651,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 if (s.CppNameOnly == "FVector")
                 {
                     mathOps = R"FVOPS(
-	// === Math helpers ===
 	FVector  operator+(const FVector& o) const { return {X + o.X, Y + o.Y, Z + o.Z}; }
 	FVector  operator-(const FVector& o) const { return {X - o.X, Y - o.Y, Z - o.Z}; }
 	FVector  operator*(const FVector& o) const { return {X * o.X, Y * o.Y, Z * o.Z}; }
@@ -765,7 +676,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 else if (s.CppNameOnly == "FVector2D")
                 {
                     mathOps = R"FV2OPS(
-	// === Math helpers ===
 	FVector2D  operator+(const FVector2D& o) const { return {X + o.X, Y + o.Y}; }
 	FVector2D  operator-(const FVector2D& o) const { return {X - o.X, Y - o.Y}; }
 	FVector2D  operator*(const FVector2D& o) const { return {X * o.X, Y * o.Y}; }
@@ -790,7 +700,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 else if (s.CppNameOnly == "FVector4")
                 {
                     mathOps = R"FV4OPS(
-	// === Math helpers ===
 	FVector4  operator+(const FVector4& o) const { return {X + o.X, Y + o.Y, Z + o.Z, W + o.W}; }
 	FVector4  operator-(const FVector4& o) const { return {X - o.X, Y - o.Y, Z - o.Z, W - o.W}; }
 	FVector4  operator*(float s)           const { return {X * s, Y * s, Z * s, W * s}; }
@@ -811,7 +720,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 else if (s.CppNameOnly == "FRotator")
                 {
                     mathOps = R"FROPS(
-	// === Math helpers (component-wise; angles, no Length-style scalar) ===
 	FRotator  operator+(const FRotator& o) const { return {Pitch + o.Pitch, Yaw + o.Yaw, Roll + o.Roll}; }
 	FRotator  operator-(const FRotator& o) const { return {Pitch - o.Pitch, Yaw - o.Yaw, Roll - o.Roll}; }
 	FRotator  operator*(float s)           const { return {Pitch * s, Yaw * s, Roll * s}; }
@@ -829,7 +737,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 else if (s.CppNameOnly == "FLinearColor")
                 {
                     mathOps = R"FLCOPS(
-	// === Math helpers (component-wise; colors, no Length / Distance) ===
 	FLinearColor  operator+(const FLinearColor& o) const { return {R + o.R, G + o.G, B + o.B, A + o.A}; }
 	FLinearColor  operator-(const FLinearColor& o) const { return {R - o.R, G - o.G, B - o.B, A - o.A}; }
 	FLinearColor  operator*(const FLinearColor& o) const { return {R * o.R, G * o.G, B * o.B, A * o.A}; }
@@ -877,12 +784,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
     if (_sdkProcessed.empty())
         return;
 
-    // ---- Phase 2: build name -> package map for cross-package linking --------
-
-    // _sdkNameToPkg is a class member (cleared at the top of DumpSDK).
-    // Without the explicit `this->`, a re-declaration here would shadow it
-    // and silently leave the real member empty, which broke per-pkg
-    // cross-pkg #include emission downstream in DumpSDK_PerPackage.
     _sdkNameToPkg.reserve(_sdkProcessed.size() * 64);
 
     auto registerType = [&](const std::string &name, size_t pkgIdx)
@@ -902,10 +803,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         }
     }
 
-    // ---- Phase 3: build inter-package dependency graph -----------------------
-
-    // Only "full" deps drive package ordering; pure forward-decl deps are
-    // satisfied by the global forward-decl block emitted up front.
+    // only full deps drive package order; fwd-decls handled separately
     std::vector<std::unordered_set<size_t>> pkgDeps(_sdkProcessed.size());
 
     auto recordDeps = [&](size_t pkgIdx, const UE_UPackage::Struct &s)
@@ -925,8 +823,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         for (const auto &c : _sdkProcessed[i].Classes)    recordDeps(i, c);
     }
 
-    // ---- Phase 4: topological sort packages ----------------------------------
-
     _sdkPkgOrder.reserve(_sdkProcessed.size());
     {
         std::vector<size_t> indices(_sdkProcessed.size());
@@ -939,10 +835,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
     }
 
 
-    // ---- Intra-package topological sort on structs / classes ----------------
-    //
-    // Same-package value-type deps must be defined first inside the same
-    // header. Run once here so all emit functions share the result.
+    // intra-package topo sort: value-type deps first
     auto sortByDeps = [&](std::vector<UE_UPackage::Struct> &items)
     {
         std::unordered_map<std::string, size_t> nameToLocal;
@@ -980,9 +873,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         if (!p.Classes.empty())    sortByDeps(p.Classes);
     }
 
-    // ---- Collect script.json function entries -------------------------------
-    //
-    // Done here once so the various emit functions don't double-collect.
     static bool processInternal_once = false;
     for (size_t pkgIdx : _sdkPkgOrder)
     {
@@ -1020,27 +910,15 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 }
 
 
-// ============================================================================
-//  SDK CoreUObject_functions.cpp body — out-of-line UObject helpers.
-//
-//  Mirrors source/UEProber/UECore/CoreUObject_functions.cpp. Everything
-//  here is non-inline so it compiles into the .cpp's TU only. Caller
-//  emits the file's #include + namespace SDK { ... } shell around this.
-// ============================================================================
 static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
 {
-    buf.append("{}", R"AIOIMPL(// Mirrors UECore CoreUObject_functions.cpp — bodies for UObject helpers
-// declared in CoreUObject_classes.hpp.
-
-// ---- ProcessEvent dispatch -----------------------------------------
-void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
+    buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 {
     using FN = void(*)(const UObject*, struct UFunction*, void*);
     auto vtbl = *reinterpret_cast<void* const* const*>(this);
     reinterpret_cast<FN>(vtbl[kProcessEventIndex])(this, Function, Parms);
 }
 
-// ---- Object lookup -------------------------------------------------
 class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
 {
     if (!GObjects) return nullptr;
@@ -1080,7 +958,6 @@ class UClass* UObject::FindClassFast(const std::string& ClassName)
     return FindObjectFast<UClass>(ClassName, EClassCastFlags{0x20}); // ::Class
 }
 
-// ---- Name helpers --------------------------------------------------
 std::string UObject::GetName() const
 {
     return NamePrivate.ToString();
@@ -1099,7 +976,6 @@ std::string UObject::GetFullName() const
     return r;
 }
 
-// ---- Type queries --------------------------------------------------
 bool UObject::HasTypeFlag(EClassCastFlags TypeFlags) const
 {
     if (!ClassPrivate) return false;
@@ -1146,19 +1022,10 @@ void UObject::TraverseSupers(const std::function<bool(const UObject*)>& Callback
 )AIOIMPL");
 }
 
-// ============================================================================
-//  EmitUClassGetFunctionBody — body for UClass::GetFunction declared by
-//  Phase 1.6 augmenter. Mirrors source/UEProber/UECore/CoreUObject_functions.cpp
-//  (UClass::GetFunction) but uses our member naming (SuperStruct / Children /
-//  Next) instead of UECore's (Super / Children / Next).
-//
-//  EClassCastFlags{0x80000} = ::Function (matches a UField that is a UFunction).
-// ============================================================================
 static void EmitUClassGetFunctionBody(BufferFmt &buf, bool emitInline)
 {
     const char *kw = emitInline ? "inline " : "";
     buf.append(
-        "// ---- UClass::GetFunction --------------------------------------------\n"
         "{}struct UFunction* UClass::GetFunction(const std::string& ClassName, "
         "const std::string& FuncName) const\n"
         "{{\n"
@@ -1176,16 +1043,6 @@ static void EmitUClassGetFunctionBody(BufferFmt &buf, bool emitInline)
         "}}\n\n", kw);
 }
 
-// ============================================================================
-//  EmitUFunctionBody — emit the C++ body for one dumped UFunction. Body
-//  shape mirrors Dumper-7's per-class functions: a static UFunction* cache,
-//  an anonymous local Parms struct mirroring the UE param layout, fill-in
-//  for in-params, ProcessEvent dispatch, copy-out for out-params, and
-//  return of Parms.ReturnValue when applicable.
-//
-//  - non-static: dispatch via ClassPrivate->GetFunction(...) + this->ProcessEvent.
-//  - static    : dispatch via StaticClass()->GetFunction(...) + GetDefaultObj()->ProcessEvent.
-// ============================================================================
 static void EmitUFunctionBody(BufferFmt &buf,
                               const UE_UPackage::Function &f,
                               bool emitInline,
@@ -1193,16 +1050,13 @@ static void EmitUFunctionBody(BufferFmt &buf,
 {
     const char *kw = emitInline ? "inline " : "";
 
-    // Strip leading "static " from CppName when emitting the out-of-line
-    // definition: `static` is only valid in the class body declaration, not
-    // on the out-of-line definition. Same applies to inline AIOHeader bodies.
+    // strip leading 'static ' — only valid in class-body declaration
     std::string headOnly = f.CppName;
     const std::string staticPrefix = "static ";
     if (headOnly.compare(0, staticPrefix.size(), staticPrefix) == 0)
         headOnly = headOnly.substr(staticPrefix.size());
 
-    // headOnly is now "<ReturnType> <FuncName>". Inject the qualifier so it
-    // becomes "<ReturnType> <Owner>::<FuncName>".
+    // inject Owner:: qualifier
     const auto spacePos = headOnly.rfind(' ');
     if (spacePos == std::string::npos)
         return; // malformed — skip
@@ -1212,24 +1066,13 @@ static void EmitUFunctionBody(BufferFmt &buf,
 
     const bool hasReturn = (f.ReturnType != "void");
 
-    // For enum types, prefix with `enum` (NOT `enum class`) when used as
-    // an elaborated type specifier in the local Parms struct or a cast.
-    // C++ accepts `enum X` to refer to either a scoped or unscoped
-    // enumeration; `enum class X` is only valid in the declaration itself
-    // and clang rejects it as a use-site specifier with
-    // -Welaborated-enum-class. The elaborated form bypasses ordinary
-    // unqualified lookup, which otherwise hits the (shadowing) parameter
-    // name when UE produces things like `EaseType EaseType`.
+    // elaborated 'enum X' (not 'enum class') — clang rejects use-site enum class
     auto qualifyType = [&](const std::string &t) -> std::string {
         return enumUnderlying.count(t) ? "enum " + t : t;
     };
 
     buf.append("{}{}({})\n{{\n", kw, qualifiedHead, f.Params);
 
-    // Function pointer cache + lookup. Static dispatch resolves through
-    // StaticClass() (cached per type via DEFINE_UE_CLASS_HELPERS); the
-    // instance dispatch reads ClassPrivate, which the Phase 1.6 augmenter
-    // typed as `struct UClass*`.
     buf.append("    static struct UFunction* Func = nullptr;\n");
     if (f.IsStatic)
     {
@@ -1242,10 +1085,7 @@ static void EmitUFunctionBody(BufferFmt &buf,
                    f.OwnerUEName, f.Name);
     }
 
-    // Anonymous local Parms struct mirroring UE's param layout. Field order
-    // matches UE's reflection iteration (the order params were pushed into
-    // ParamsList by GenerateFunction). The trailing ReturnValue (if any) is
-    // emitted last — UE places it at the end of the param block.
+    // Parms struct: param order matches UE reflection, ReturnValue last
     buf.append("    struct\n    {{\n");
     for (const auto &p : f.ParamsList)
     {
@@ -1259,14 +1099,8 @@ static void EmitUFunctionBody(BufferFmt &buf,
         buf.append("        {} ReturnValue;\n", qualifyType(f.ReturnType));
     buf.append("    }} Parms{{}};\n");
 
-    // Fill in-params. ConstParm + OutParm degenerates to "const Type&" in
-    // signature but is treated as an in-param at marshalling time. Pure
-    // out-params are *not* filled (callers don't pass anything in).
-    //
-    // The C-style cast on the assignment is deliberate: `const ConstParm`
-    // refs would otherwise refuse to bind to the non-const Parms field
-    // (`assigning to T* from const T* discards qualifiers`). For non-const
-    // params the cast is a no-op the compiler folds away.
+    // fill in-params; pure out-params stay default-constructed.
+    // C-cast strips ConstParm const so refs bind to non-const Parms field.
     for (const auto &p : f.ParamsList)
     {
         const bool isOut       = (p.Flags & CPF_OutParm) != 0;
@@ -1281,16 +1115,12 @@ static void EmitUFunctionBody(BufferFmt &buf,
             buf.append("    Parms.{} = ({}){};\n", p.Name, qualifyType(p.Type), p.Name);
     }
 
-    // Dispatch. Static path goes through GetDefaultObj() — DEFINE_UE_CLASS_HELPERS
-    // emits this static accessor on every dumped class. Non-static path is
-    // a direct member call (ProcessEvent inherited from UObject).
     if (f.IsStatic)
         buf.append("    GetDefaultObj()->ProcessEvent(Func, &Parms);\n");
     else
         buf.append("    this->ProcessEvent(Func, &Parms);\n");
 
-    // Copy out: pure out-params (without ConstParm) get written back from
-    // Parms into the caller's reference.
+    // copy out: pure out-params back to caller
     for (const auto &p : f.ParamsList)
     {
         const bool isOut      = (p.Flags & CPF_OutParm) != 0;
@@ -1310,11 +1140,6 @@ static void EmitUFunctionBody(BufferFmt &buf,
     buf.append("}}\n\n");
 }
 
-// ============================================================================
-//  EmitPackageFunctionBodies — emit ProcessEvent dispatch bodies for every
-//  UFunction across every Class in `pkg`. UScriptStructs are skipped — they
-//  have no associated UFunction children.
-// ============================================================================
 static void EmitPackageFunctionBodies(BufferFmt &buf,
                                       const UE_UPackage &pkg,
                                       bool emitInline,
@@ -1323,18 +1148,13 @@ static void EmitPackageFunctionBodies(BufferFmt &buf,
     for (const auto &c : pkg.Classes)
     {
         if (c.Functions.empty()) continue;
-        buf.append("// ---- {}::* ----\n", c.CppNameOnly);
+        buf.append("// {}\n", c.CppNameOnly);
         for (const auto &f : c.Functions)
             EmitUFunctionBody(buf, f, emitInline, enumUnderlying);
     }
 }
 
-// Strip a UTF-8 BOM (EF BB BF) embedded at the start of an embedded source.
-// The UECore raw-string embeds reproduce their source files byte-for-byte;
-// `source/UEProber/UECore/UnrealContainers.h` ships with a BOM, which makes
-// clang reject the dumped output ("unexpected character <U+FEFF>"). The
-// embedded raw string starts with a newline (the opening `R"UECoreUC(` is
-// on its own line), so the BOM lands at offset 1. Handle both shapes.
+// strip leading UTF-8 BOM (clang rejects U+FEFF); BOM may be at offset 0 or 1
 static std::string StripUtf8Bom(std::string content)
 {
     constexpr const char *kBom = "\xef\xbb\xbf";
@@ -1350,11 +1170,7 @@ static std::string StripUtf8Bom(std::string content)
     return content;
 }
 
-// Substitute the embedded `#define bWITH_CASE_PRESERVING_NAME false` with
-// `... true` when the per-game profile flags case-preserving FName. The
-// switch flips ComparisonIndex/DisplayIndex from a 4-byte union into two
-// separate 4-byte fields, growing FName from 8 to 12 bytes — matches the
-// per-game UE_Offsets::FName.Size that drives Phase 1.6's NamePrivate slot.
+// patch bWITH_CASE_PRESERVING_NAME from per-game profile (8B union -> 12B fields)
 static std::string ApplyCasePreservingDefine(std::string content, bool casePreserving)
 {
     if (!casePreserving) return content;
@@ -1366,11 +1182,7 @@ static std::string ApplyCasePreservingDefine(std::string content, bool casePrese
     return content;
 }
 
-// Re-target Basic.cpp's `#include "CoreUObject_classes.h"` to the .hpp
-// extension the dumper actually emits. Source side keeps the .h spelling
-// because it neighbours the prober runtime header at
-// source/UEProber/UECore/CoreUObject_classes.h, but the SDK output only
-// has CoreUObject_classes.hpp.
+// retarget Basic.cpp's CoreUObject_classes.h include to .hpp
 static std::string RetargetBasicCppIncludes(std::string content)
 {
     const std::string from = "#include \"CoreUObject_classes.h\"";
@@ -1381,20 +1193,6 @@ static std::string RetargetBasicCppIncludes(std::string content)
     return content;
 }
 
-// ============================================================================
-//  EmitSDKCoreFiles — shared core-file emit for SDK_A and SDK_B.
-//
-//  Lays down at <prefix>:
-//    Basic.h                         (UECore embed verbatim)
-//    Basic.cpp                       (UECore embed, member names patched)
-//    UnrealContainers.h              (UECore embed verbatim)
-//    CoreUObject_structs.hpp         (enums + ScriptStructs in namespace SDK)
-//    CoreUObject_classes.hpp         (Classes + AIOCore + ProcessEvent inline)
-//    CoreUObject_functions.cpp       (UObject + UClass helpers + UFunction bodies)
-//
-//  Caller is responsible for the SDK.hpp aggregator (they differ between
-//  SDK_A and SDK_B) and any per-package files beyond CoreUObject.
-// ============================================================================
 static void EmitSDKCoreFiles(
     const std::string& prefix,
     const UE_UPackage& corePkg,
@@ -1403,42 +1201,25 @@ static void EmitSDKCoreFiles(
     const std::unordered_map<std::string, std::string>& enumUnderlying,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
-    // ---- 1. UECore companions (verbatim embed) -------------------------
-    // Basic.h's bWITH_CASE_PRESERVING_NAME #define is patched per-profile
-    // so the embedded FName layout (8B union vs 12B separate fields)
-    // matches the per-game UE_Offsets::FName.Size.
-    //
-    // StripUtf8Bom is applied to every embed: the source UECore files may
-    // ship with a UTF-8 BOM (currently UnrealContainers.h does), which
-    // clang rejects as "unexpected character <U+FEFF>" when the dumped
-    // output is included in a TU.
     outBuffersMap[prefix + "Basic.h"].append("{}",
         StripUtf8Bom(ApplyCasePreservingDefine(kUECoreBasicH, casePreserving)));
     outBuffersMap[prefix + "Basic.cpp"].append("{}",
         RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
 
-    // utfcpp dependency: UnrealContainers.h's FString::ToString uses
-    // utf8::unchecked::utf16to8 on GCC/Clang. Drop the two-file utfcpp
-    // subset (unchecked.h + its core.h) under <prefix>utfcpp/ so the
-    // SDK directory is fully self-contained.
+    // utfcpp shipped under <prefix>utfcpp/ so SDK is self-contained
     outBuffersMap[prefix + "utfcpp/core.h"].append("{}", StripUtf8Bom(kUtfcppCoreH));
     outBuffersMap[prefix + "utfcpp/unchecked.h"].append("{}", StripUtf8Bom(kUtfcppUncheckedH));
 
-    // ---- 2. CoreUObject_structs.hpp ------------------------------------
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_structs.hpp"];
         buf.append("#pragma once\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"UnrealContainers.h\"\n");
-        // <cmath> for the math-helper ops (Length / Dot / Normalize ...)
-        // injected on FVector / FVector2D / FRotator / etc.
-        buf.append("#include <cmath>\n\n");
+        buf.append("#include <cmath>\n\n"); // for injected math helpers
 
-        // DEFINE_UE_CLASS_HELPERS macro — used by every dumped Class via
-        // Phase 1.6b. Macros are global; emitting once here covers both
-        // _structs.hpp and _classes.hpp (which #includes structs.hpp) plus
-        // every non-core Packages/<pkg>.hpp that transitively pulls structs.
+        // DEFINE_UE_CLASS_HELPERS macro emitted once here; transitively
+        // pulled by _classes.hpp and every Packages/<pkg>.hpp.
         buf.append("{}", R"AIOMACRO(#ifndef DEFINE_UE_CLASS_HELPERS
 #define DEFINE_UE_CLASS_HELPERS(FullClassName, ClassNameStr) \
     static struct UClass* StaticClass() { return StaticClassImpl<ClassNameStr>(); } \
@@ -1457,15 +1238,12 @@ static void EmitSDKCoreFiles(
         buf.append("}} // namespace SDK\n");
     }
 
-    // ---- 3. CoreUObject_classes.hpp ------------------------------------
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_classes.hpp"];
         buf.append("#pragma once\n\n");
         buf.append("#include \"CoreUObject_structs.hpp\"\n\n");
         buf.append("namespace SDK\n{{\n\n");
 
-        // Runtime-discovered ProcessEvent vtable index, consumed by
-        // UObject::ProcessEvent's body in CoreUObject_functions.cpp.
         buf.append("constexpr int kProcessEventIndex = {};\n\n", processEventIndex);
 
         buf.append("// Package: CoreUObject - Classes({})\n\n", corePkg.Classes.size());
@@ -1476,16 +1254,10 @@ static void EmitSDKCoreFiles(
         buf.append("\n}} // namespace SDK\n");
     }
 
-    // ---- 4. CoreUObject_functions.cpp (UObject + UClass helpers + bodies) -
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
-        buf.append("// CoreUObject helper bodies. Mirrors\n");
-        buf.append("// source/UEProber/UECore/CoreUObject_functions.cpp plus the\n");
-        buf.append("// ProcessEvent dispatch body for every UFunction in CoreUObject.\n");
-        buf.append("//\n");
-        buf.append("// Compile and link this .cpp into your TU(s). The bodies depend\n");
-        buf.append("// on FName::s_NameResolver and UObject::GObjects being wired\n");
-        buf.append("// from your bridge once at startup.\n\n");
+        buf.append("// Bodies for UObject helpers + UFunction dispatch.\n");
+        buf.append("// Wire FName::s_NameResolver and UObject::GObjects at startup.\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
@@ -1497,16 +1269,6 @@ static void EmitSDKCoreFiles(
     }
 }
 
-// ============================================================================
-//  DumpAIOHeader — browse-only types dump.
-//
-//  Dumps every UE enum / struct / class definition into one file, wrapped in
-//  `namespace SDK`. NOT a compilation entry point: there's no preamble for
-//  TArray/FName/FString/etc., no inline ProcessEvent bodies, no AIO core
-//  helpers, no forward-decl block, no phantom-fwd-decl block. Use SDK_A/ for
-//  the buildable per-pkg split; this header is for grep / IDE jump-to-def /
-//  quick reference.
-// ============================================================================
 void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
 {
     if (_sdkProcessed.empty())
@@ -1525,9 +1287,7 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
     }
 
     aioBufferFmt.append("#pragma once\n\n");
-    aioBufferFmt.append("// AIOHeader.hpp — browse-only types dump. Not a compilation entry\n");
-    aioBufferFmt.append("// point. Use SDK_A/ for the buildable per-pkg split. This file\n");
-    aioBufferFmt.append("// exists for grep / IDE jump-to-def / quick reference.\n\n");
+    aioBufferFmt.append("// AIOHeader.hpp - browse-only types dump (not a compilation entry point).\n\n");
     aioBufferFmt.append("namespace SDK\n{{\n\n");
 
     int packages_saved = 0;
@@ -1563,29 +1323,6 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
     logsBufferFmt.append("==========================\n");
 }
 
-// ============================================================================
-//  DumpSDK_PerPackage (Plan A) — full Dumper-7-style output.
-//
-//  Layout:
-//    SDK_A/
-//    ├── Basic.h                         (UECore embed)
-//    ├── Basic.cpp                       (UECore embed, member-name patched)
-//    ├── UnrealContainers.h              (UECore embed)
-//    ├── CoreUObject_classes.hpp         (UECore-style 4-file split for core)
-//    ├── CoreUObject_structs.hpp
-//    ├── CoreUObject_parameters.hpp
-//    ├── CoreUObject_functions.cpp
-//    ├── SDK.hpp                         (aggregator)
-//    └── Packages/
-//        ├── Engine.hpp                  (one .hpp per non-CoreUObject pkg)
-//        ├── GameplayAbilities.hpp
-//        └── ...
-//
-//  CoreUObject is the only pkg that gets the UECore 4-file split (it's the
-//  reflection foundation everything else builds on). Other pkgs stay as a
-//  single self-contained .hpp under Packages/. SDK_B is the same minus the
-//  Packages/ subdirectory.
-// ============================================================================
 void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap)
 {
     if (_sdkProcessed.empty())
@@ -1594,7 +1331,6 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         return;
     }
 
-    // Locate CoreUObject — it's the foundation, everything else depends on it.
     const size_t kNotFound = static_cast<size_t>(-1);
     size_t coreIdx = kNotFound;
     for (size_t i = 0; i < _sdkProcessed.size(); ++i)
@@ -1614,14 +1350,12 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     const std::string prefix = "SDK_A/";
     const std::string pkgPrefix = prefix + "Packages/";
 
-    // ---- 1. Root files (UECore companions + CoreUObject 4-file split) -----
     const bool casePreserving =
         _profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets()
             ? _profile->GetUEVars()->GetOffsets()->Config.isUsingCasePreservingName
             : false;
     EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, casePreserving, _sdkEnumUnderlying, outBuffersMap);
 
-    // ---- 2. Per-package: Packages/<pkg>.hpp for every non-CoreUObject pkg ---
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)
     {
@@ -1631,27 +1365,11 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         auto &buf = outBuffersMap[fname];
 
         buf.append("#pragma once\n\n");
-        // CoreUObject_classes.hpp transitively pulls _structs.hpp + Basic.h +
-        // UnrealContainers.h, giving us UObject + every dumped CoreUObject type.
+        // pulls _structs.hpp + Basic.h + UnrealContainers.h transitively
         buf.append("#include \"../CoreUObject_classes.hpp\"\n");
 
-        // Cross-pkg dep emission strategy:
-        //   FullDeps (struct/class) -> #include source pkg's .hpp. FullDeps
-        //                              form a DAG on struct/class types
-        //                              (Phase 3 tops-sorts on them).
-        //   FullDeps (enum)         -> `enum class EFoo : ut;` forward decl.
-        //                              Always — even when usage is by-value,
-        //                              an opaque-enum-declaration with the
-        //                              underlying type is enough to size a
-        //                              member field. Enum FullDeps cycle in
-        //                              practice (e.g. GPGameInput's enum
-        //                              referenced from GPGlobalDefines and
-        //                              vice versa), so we MUST avoid the
-        //                              #include path for enums.
-        //   ForwardDeps (struct)    -> `struct EFoo;` forward decl. Same
-        //                              cycle-avoidance reason as enum
-        //                              FullDeps (UE Engine <-> UMG etc).
-        //   ForwardDeps (enum)      -> `enum class EFoo : ut;` forward decl.
+        // Cross-pkg deps: struct FullDep -> #include; enum FullDep or any
+        // ForwardDep -> fwd-decl (enums always fwd-decl to avoid cycles).
         std::set<std::string> depPkgs;
         std::set<std::string> crossPkgFwdDecls;
         auto recordFwdDecl = [&](const std::string &dep, size_t depPkgIdx) {
@@ -1690,14 +1408,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
                    pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
 
-        // Forward decl block. Covers:
-        //   (a) Same-package struct/class — within-file refs through
-        //       pointer/handle wrappers across topo-sorted definition order.
-        //   (b) Cross-package struct/class pointer-only refs — avoids
-        //       #include cycles.
-        //   (c) Cross-package enum refs (any usage) — emitted with their
-        //       underlying type so the consumer can use them as sized
-        //       member fields without #including the defining pkg.
+        // fwd-decls: same-pkg + cross-pkg ptr-only + cross-pkg enums
         if (!pkg.Structures.empty() || !pkg.Classes.empty() || !crossPkgFwdDecls.empty())
         {
             for (const auto &n : crossPkgFwdDecls)
@@ -1722,19 +1433,9 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         buf.append("}} // namespace SDK\n");
         ++nonCorePkgCount;
 
-        // ---- 2b. <pkg>_functions.cpp (out-of-line bodies, link-time) -------
-        // Bodies need *complete* types (Parms.X member access, memcpy with
-        // sizeof). The sibling <pkg>.hpp covers same-package + struct-level
-        // FullDeps; we additionally collect every other non-core pkg whose
-        // type appears in any function signature, since param types may be
-        // forward-decl-only at <pkg>.hpp level.
-        //
-        // Emitting bodies as non-inline definitions in a separate .cpp keeps
-        // SDK.hpp itself a pure declaration aggregator. Each consuming TU
-        // pays only for the headers it actually uses; the function bodies
-        // compile once when the user adds Packages/*.cpp + CoreUObject_*.cpp
-        // + Basic.cpp to their build (e.g. via `file(GLOB_RECURSE ... *.cpp)`
-        // in CMake, see misc/sdk_smoke/CMakeLists.txt).
+        // <pkg>_functions.cpp: out-of-line bodies. Pulls every other non-core
+        // pkg referenced by a function signature, since those may be fwd-only
+        // in <pkg>.hpp.
         const std::string fnFname = pkgPrefix + pkg.PackageName + "_functions.cpp";
         auto &fbuf = outBuffersMap[fnFname];
         fbuf.append("#include \"{}.hpp\"\n", pkg.PackageName);
@@ -1768,24 +1469,11 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         fbuf.append("}} // namespace SDK\n");
     }
 
-    // ---- 3. SDK.hpp aggregator -------------------------------------------
-    //
-    // Pure declaration aggregator: every Packages/*.hpp transitively. Function
-    // bodies live in Packages/*_functions.cpp and are compiled into the user's
-    // build separately (recommended: `file(GLOB_RECURSE SDK_SRCS SDK_A/*.cpp)`
-    // in CMake — see misc/sdk_smoke/CMakeLists.txt). Avoids the per-TU re-
-    // instantiation cost that header-only inline bodies caused (a 56-second
-    // -fsyntax-only on a single Demo.cpp before this change).
     {
         auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
         sdkBuf.append("#pragma once\n\n");
-        sdkBuf.append("// Declaration-only aggregator: CoreUObject_classes.hpp + every\n");
-        sdkBuf.append("// Packages/*.hpp. UFunction bodies live in Packages/*_functions.cpp\n");
-        sdkBuf.append("// (out-of-line) and CoreUObject_functions.cpp + Basic.cpp must be\n");
-        sdkBuf.append("// linked into your build. With CMake, glob the *.cpp files under\n");
-        sdkBuf.append("// the SDK_A directory and add them to your target's sources — see\n");
-        sdkBuf.append("// misc/sdk_smoke/CMakeLists.txt in the AndUEProber repo for an\n");
-        sdkBuf.append("// example.\n\n");
+        sdkBuf.append("// SDK.hpp - declaration aggregator.\n");
+        sdkBuf.append("// Compile/link Packages/*_functions.cpp + CoreUObject_functions.cpp + Basic.cpp.\n\n");
         sdkBuf.append("#include \"CoreUObject_classes.hpp\"\n");
         for (size_t pkgIdx : _sdkPkgOrder)
         {

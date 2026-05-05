@@ -35,8 +35,8 @@ public:
         std::string CppName;        // "[static ]<ReturnType> <FuncName>"
         std::string Params;         // "(Type Name, Type& OutName, ...)"  payload only
         std::string ReturnType;     // "void" / "FVector" / ...
-        std::string OwnerCppName;   // CppNameOnly of the parent struct, e.g. "UAnimNotify" — used as the C++ qualifier in out-of-line bodies
-        std::string OwnerUEName;    // UE FName of the parent struct, e.g. "AnimNotify" — passed to UClass::GetFunction at runtime
+        std::string OwnerCppName;   // owner struct C++ name (qualifier in out-of-line bodies)
+        std::string OwnerUEName;    // owner struct UE FName (passed to UClass::GetFunction)
         std::vector<Param> ParamsList;
         bool        IsStatic = false; // FUNC_Static
         uint32_t EFlags = 0;
@@ -56,19 +56,13 @@ public:
         uint32_t Size = 0;
         std::vector<Member> Members;
         std::vector<Function> Functions;
-        // Names of other dumped types this struct needs as a complete type
-        // (inheritance, value-type members). Populated during Process().
+        // other dumped types needed as complete type (inheritance, value members)
         std::set<std::string> FullDeps;
-        // Names of other dumped types referenced via pointer/template
-        // wrappers — only forward declarations are required to compile.
+        // other dumped types needing only fwd-decl (ptr/wrapper refs)
         std::set<std::string> ForwardDeps;
-        // Optional extra C++ source appended verbatim inside the struct body
-        // (after Members and Functions). Used by the AIOCore augmenter to
-        // inject inline method declarations on core reflection types.
+        // extra C++ appended after Members/Functions (e.g. AIOCore method decls)
         std::string ExtraDecls;
-        // Optional extra C++ source appended verbatim inside the struct body
-        // before Members. Holds DEFINE_UE_CLASS_HELPERS on every Class and
-        // UObject::GObjects on UObject itself.
+        // extra C++ prepended before Members (e.g. DEFINE_UE_CLASS_HELPERS, GObjects)
         std::string PrefixDecls;
     };
     struct Enum
@@ -103,10 +97,7 @@ public:
     inline UE_UObject GetObject() const { return UE_UObject(Package->first); }
     void Process();
 
-    // Parse a C++ type string (as produced by the dumper) and split the
-    // referenced dumped-type names into "full" deps (need a complete type)
-    // and "forward" deps (a forward declaration is enough). Builtins,
-    // primitives and predefined wrapper templates are filtered out.
+    // split type-string idents into full-deps vs fwd-deps
     static void ExtractTypeDeps(const std::string &typeStr,
                                 std::set<std::string> &fullDeps,
                                 std::set<std::string> &fwdDeps);

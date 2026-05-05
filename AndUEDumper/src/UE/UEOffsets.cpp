@@ -449,9 +449,7 @@ namespace UE_DefaultOffsets
             offsets.UStruct.ChildProperties = offsets.UStruct.Children + sizeof(void *);  // FField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.ChildProperties + sizeof(void *);
 
-            // UE 4.25-5.x default UClass layout (Dumper-7 reference): UStruct
-            // (~0xB0) + 0x28 pad → CastFlags @ 0xD8, then 0x58 pad →
-            // DefaultObject @ 0x138. Per-game profile may override.
+            // UE 4.25-5.x default UClass: CastFlags @ 0xD8, DefaultObject @ 0x138 (per-game may override)
             offsets.UClass.CastFlags = 0xD8;
             offsets.UClass.DefaultObject = 0x138;
 

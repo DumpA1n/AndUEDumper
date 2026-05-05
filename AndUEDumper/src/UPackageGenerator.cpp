@@ -44,11 +44,7 @@ void UE_UPackage::FillPadding(const UE_UStruct &object, std::vector<Member> &mem
     }
 }
 
-// Replace characters that aren't valid in C++ identifiers with '_'. Real
-// dumps contain UE class names like `UFoo~Bar` and `UBaz-Qux` (auto-named
-// blueprint subclasses). Structural punctuation that legitimately appears
-// in our type strings — '<>', ',', '*', '&', ':', '[]', whitespace — is
-// preserved so templates and bit-field markers stay parseable.
+// SanitizeForCpp: replace non-identifier chars with '_'; preserve template/decl punctuation.
 static std::string SanitizeForCpp(const std::string &in)
 {
     std::string out;
@@ -67,9 +63,7 @@ static std::string SanitizeForCpp(const std::string &in)
     return out;
 }
 
-// Stricter sanitizer for pure-identifier positions: struct / enum / member /
-// function names that come from an FName and may contain spaces or any
-// other non-identifier byte. Anything outside [A-Za-z0-9_] becomes '_'.
+// SanitizeIdentifier: strict [A-Za-z0-9_]+ for pure-ident positions
 static std::string SanitizeIdentifier(const std::string &in)
 {
     std::string out;
@@ -82,11 +76,7 @@ static std::string SanitizeIdentifier(const std::string &in)
     return out;
 }
 
-// SanitizeIdentForCpp — used for positions that become C++ identifiers in
-// a body/declaration where they must NOT collide with C++ keywords or with
-// the local variables we generate inside ProcessEvent dispatch bodies
-// (`Parms`, `Func`). Characters are filtered as in SanitizeIdentifier; if
-// the result is a keyword/reserved name, an underscore is appended.
+// SanitizeIdentForCpp: SanitizeIdentifier + suffix '_' if C++ keyword or reserved local
 static std::string SanitizeIdentForCpp(const std::string &in)
 {
     std::string out = SanitizeIdentifier(in);
@@ -107,8 +97,7 @@ static std::string SanitizeIdentForCpp(const std::string &in)
         "struct","switch","template","this","thread_local","throw","true","try",
         "typedef","typeid","typename","union","unsigned","using","virtual","void",
         "volatile","wchar_t","while","xor","xor_eq",
-        // Locals our emitted ProcessEvent bodies use — keep param names from
-        // shadowing them. UE rarely generates these but BP-named params can.
+        // generated locals — UE BP-named params can shadow these
         "Parms","Func",
     };
     if (kReserved.count(out))
@@ -116,9 +105,7 @@ static std::string SanitizeIdentForCpp(const std::string &in)
     return out;
 }
 
-// Identifiers that come from primitive C++ types or the AIOHeader preamble
-// (predefined containers, smart pointers, basic UE types). Members of this
-// set never become package-level dependencies.
+// builtins/preamble idents — never count as package deps
 static const std::unordered_set<std::string> &kBuiltinIdents()
 {
     static const std::unordered_set<std::string> s = {
@@ -141,18 +128,13 @@ static const std::unordered_set<std::string> &kBuiltinIdents()
         "TWeakObjectPtr", "TLazyObjectPtr",
         "TSoftObjectPtr", "TSoftClassPtr",
         "TSubclassOf", "TScriptInterface", "TFieldPath",
-        // Sentinel emitted by the dumper for malformed/unknown children —
-        // forward-declared in the AIOHeader preamble so containers compile.
+        // sentinel for unknown children; fwd-declared in preamble
         "None", "FNone",
     };
     return s;
 }
 
-// Two flavors of template wrappers based on how they store their parameter T:
-//  - PtrHandle:    stores T* (or an opaque handle); fwd decl of T suffices.
-//  - ValueHolding: stores T by value (TPair has `T First; U Second;`; TSet
-//                  embeds TSparseArray<TPair<...>>; TMap embeds a TSet of
-//                  TPair). Instantiating these requires T to be complete.
+// WrapperKind: PtrHandle (stores T*, fwd-decl OK) vs ValueHolding (needs complete T)
 enum class WrapperKind { PtrHandle, ValueHolding };
 
 static bool ClassifyWrapper(const std::string &ident, WrapperKind *out)
@@ -177,12 +159,8 @@ void UE_UPackage::ExtractTypeDeps(const std::string &typeStr,
 {
     const auto &builtins = kBuiltinIdents();
 
-    // Each open '<' pushes a wrapper kind. An ident inside the stack must be
-    // a fullDep if ANY enclosing wrapper is value-holding, because that
-    // wrapper instantiation can't be sized without T being complete. A
-    // pointer argument (`T*`) is always fine as fwdDep regardless of wrapper.
-    // Unknown templates fall back to ValueHolding — over-including is
-    // harmless, missing an include breaks the build.
+    // stack of wrapper kinds; full-dep if any enclosing wrapper is value-holding.
+    // T* always fwd-only. Unknown templates fall back to ValueHolding.
     std::vector<WrapperKind> wstack;
     bool                     pendingHasKind = false;
     WrapperKind              pendingKind    = WrapperKind::ValueHolding;
@@ -214,8 +192,7 @@ void UE_UPackage::ExtractTypeDeps(const std::string &typeStr,
                 i++;
             std::string ident = typeStr.substr(start, i - start);
 
-            // Consume trailing whitespace as part of the ident so the
-            // wrapper-then-'<' link survives `TMap <K, V>`-style spacing.
+            // consume trailing ws so 'TMap <K, V>' still parses
             while (i < n && std::isspace(static_cast<unsigned char>(typeStr[i])))
                 i++;
 
@@ -340,9 +317,7 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         out->Params.erase(out->Params.size() - 2);
     }
 
-    // CppName composes the C++ declaration head emitted in the class body:
-    //   [static ]<ReturnType> <FuncName>
-    // …and AppendStructsToBuffer appends `(<Params>);` to it.
+    // CppName = '[static ]<ReturnType> <FuncName>' (Params appended later)
     out->CppName.clear();
     if (out->IsStatic)
         out->CppName += "static ";
@@ -398,10 +373,7 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         m->Name = SanitizeIdentifier(prop->GetName());
         m->Offset = prop->GetOffset();
 
-        // Unknown property types come back with a placeholder name (often
-        // "None"/"ENone") whose definition would never compile. Replace
-        // the type with an opaque byte buffer matching the dumped size —
-        // readers still get correct offsets, just no field-typed access.
+        // unknown types ('None'/'ENone'): replace with opaque uint8_t buffer
         if (type.first == UEPropertyType::Unknown
             || m->Type.empty()
             || m->Type == "None"
@@ -442,8 +414,7 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             }
             if (ones == 0)
             {
-                // Mask was zero (or unrecognised). C++ rejects a named
-                // zero-width bit-field, so fall back to a full byte.
+                // mask was zero; C++ rejects 0-width bit-field, use full byte
                 offset += m->Size;
                 m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
             }
@@ -494,10 +465,7 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             GenerateFunction(fn, &f);
             f.OwnerCppName = s.CppNameOnly;
             f.OwnerUEName = s.Name;
-            // Function param/return types reference other types but only
-            // through value/reference parameters in declarations — these
-            // can use forward declarations because the function body lives
-            // outside this header.
+            // fn signatures only need fwd-decls (bodies live in .cpp)
             ExtractTypeDeps(f.CppName, s.ForwardDeps, s.ForwardDeps);
             ExtractTypeDeps(f.Params, s.ForwardDeps, s.ForwardDeps);
             s.Functions.push_back(f);
@@ -551,9 +519,7 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
             max = value;
 
         std::string sanitized = SanitizeIdentifier(str);
-        // UE reflection occasionally exposes duplicate enumerator names within
-        // the same enum (different underlying values). C++ would reject the
-        // redefinition, so we drop later occurrences.
+        // drop duplicate enumerator names (C++ rejects redefinition)
         if (!seenEnumNames.insert(sanitized).second)
             continue;
 
@@ -613,9 +579,7 @@ void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBu
         pBufFmt->append("// Object: {}\n// Size: 0x{:X} (Inherited: 0x{:X})\n{}\n{{",
                         s.FullName, s.Size, s.Inherited, s.CppName);
 
-        // Build segments first; emit them with a single blank line between
-        // adjacent segments so layout stays uniform regardless of which
-        // segments are populated.
+        // emit segments with single blank between, regardless of which exist
         std::vector<std::string> segs;
 
         if (!s.PrefixDecls.empty())
