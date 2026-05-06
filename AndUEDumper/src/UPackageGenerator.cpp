@@ -626,8 +626,28 @@ void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBu
     }
 }
 
+// Enumerator names that collide with system-header macros. Rename
+// collisions to <EnumName>_<OriginalName> so the preprocessor doesn't
+// rewrite them. Add new entries as they show up.
+static const std::unordered_set<std::string> &kSystemMacroConflicts()
+{
+    static const std::unordered_set<std::string> s = {
+        "EM_MAX", // <bits/elf_common.h>: #define EM_MAX 102
+    };
+    return s;
+}
+
 void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt)
 {
+    const auto &conflicts = kSystemMacroConflicts();
+
+    auto qualify = [&](const std::string &enumName, const std::string &enumeratorName) -> std::string
+    {
+        if (conflicts.count(enumeratorName))
+            return enumName + "_" + enumeratorName;
+        return enumeratorName;
+    };
+
     for (auto &e : arr)
     {
         pBufFmt->append("// Object: {}\n{}\n{{", e.FullName, e.CppName);
@@ -636,11 +656,11 @@ void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt
         for (size_t i = 0; i < lastIdx; i++)
         {
             auto &m = e.Members.at(i);
-            pBufFmt->append("\n\t{} = {},", m.first, m.second);
+            pBufFmt->append("\n\t{} = {},", qualify(e.CppNameOnly, m.first), m.second);
         }
 
         auto &m = e.Members.at(lastIdx);
-        pBufFmt->append("\n\t{} = {}", m.first, m.second);
+        pBufFmt->append("\n\t{} = {}", qualify(e.CppNameOnly, m.first), m.second);
 
         pBufFmt->append("\n}};\n\n");
     }
