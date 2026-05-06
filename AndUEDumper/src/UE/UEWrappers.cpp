@@ -125,8 +125,8 @@ std::string UE_FName::GetName() const
     if (!object) return "None";
 
     uintptr_t nameID_offset = UEWrappers::GetOffsets()->FName.ComparisonIndex;
-    // if (UEWrappers::GetOffsets()->isUsingCasePreservingName)
-    //   nameID_offset = UEWrappers::GetOffsets()->FName.DisplayIndex;
+    if (UEWrappers::GetOffsets()->Config.isUsingCasePreservingName)
+        nameID_offset = UEWrappers::GetOffsets()->FName.DisplayIndex;
 
     int32_t index = 0;
     if (!vm_rpm_ptr(object + nameID_offset, &index, sizeof(int32_t)) || index < 0)
