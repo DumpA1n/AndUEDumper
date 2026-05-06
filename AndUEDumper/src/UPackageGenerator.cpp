@@ -371,7 +371,7 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
 
         auto type = prop->GetType();
         m->Type = SanitizeForCpp(type.second);
-        m->Name = SanitizeIdentifier(prop->GetName());
+        m->Name = SanitizeIdentForCpp(prop->GetName());
         m->Offset = prop->GetOffset();
 
         // unknown types ('None'/'ENone'): replace with opaque uint8_t buffer
@@ -519,7 +519,7 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
         if (value > max)
             max = value;
 
-        std::string sanitized = SanitizeIdentifier(str);
+        std::string sanitized = SanitizeIdentForCpp(str);
         // drop duplicate enumerator names (C++ rejects redefinition)
         if (!seenEnumNames.insert(sanitized).second)
             continue;
