@@ -175,6 +175,21 @@ SizeOf(FFieldPathProperty)  = FProperty.Size + FName.Size
 
 其中 `SubPropertyBase = UE_Offsets.FProperty.SubPropertyBase`。
 
+### 4.4 Inherited 一般规则与 FProperty 例外
+
+合成时 `s.Inherited = SizeOf(parent)`（§3.3 默认规则）。但 **FProperty 的 Inherited 需要 clamp 到探到的 `ArrayDim`**：
+
+```
+Inherited(FProperty) = min( SizeOf(FField), UE_Offsets.FProperty.ArrayDim )
+                     = min( align8(FlagsPrivate + 4), ArrayDim )
+```
+
+原因：UE 4.25+ 标准 build 下，编译器把 `FProperty.ArrayDim`（int32，4 字节）塞进 FField 末尾 `FlagsPrivate@0x30+4..0x37` 的 4 字节对齐 pad（合法 C++ 派生类 trailing-padding reuse），所以 prober 实测 `ArrayDim @ 0x34`。但 `SizeOf(FField) = align8(0x34) = 0x38`，augment 把 offset < 0x38 的字段全 erase（[Dumper.cpp augment 块][4]），ArrayDim 直接消失。
+
+DFM-style alt layout 把 ArrayDim 对齐到 0x38，min 是 no-op，行为不变。所以这条 clamp 是单向修正：标准 layout 修好，DFM 不受影响。
+
+> 注：这只调 `Inherited(FProperty)`，**不**改 `SizeOf(FField)` 本身——FField 作为独立结构 emit 时仍然 0x38（C++ 自动按最大成员 8 字节对齐），只是 FProperty 看父类的 "可被复用范围" 比 SizeOf 小 4 字节。
+
 ## 5. fieldsFor 扩展
 
 [Dumper.cpp:480 `fieldsFor`][6] 在现有 UObject 派生分支之后追加 reflection 派生分支：

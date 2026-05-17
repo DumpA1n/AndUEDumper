@@ -461,6 +461,18 @@ void UEDumper::SynthesizeReflectionTypes()
             s.CppName += t.parent;
             auto pit = sizeOf.find(t.parent);
             s.Inherited = pit != sizeOf.end() ? pit->second : 0;
+            // UE 4.25+ standard layout packs FProperty.ArrayDim into FField's
+            // trailing 4-byte alignment pad (probe finds ArrayDim @ 0x34, but
+            // sizeOf[FField] = align8(FlagsPrivate + 4) = 0x38). augment erases
+            // any field with offset < Inherited, so without this clamp the
+            // dump silently drops ArrayDim. DFM-style alt layout (ArrayDim
+            // already at 0x38) is unaffected because the min(...) is a no-op.
+            if (std::string(t.cppName) == "FProperty"
+                && offs.FProperty.ArrayDim != 0
+                && offs.FProperty.ArrayDim < s.Inherited)
+            {
+                s.Inherited = static_cast<uint32_t>(offs.FProperty.ArrayDim);
+            }
         }
         s.Size = sizeOf[t.cppName];
         // Members stays empty — augment() fills via fieldsFor() in next step.
