@@ -110,6 +110,17 @@ struct UE_Offsets
         uintptr_t NamePrivate = 0;
         uintptr_t FlagsPrivate = 0;
     } FField;
+    // FFieldClass (FField::ClassPrivate points here). Layout has been stable across
+    // UE 4.25 ~ 5.x; per-game profile may override. Size lets synthesize emit it.
+    struct
+    {
+        uintptr_t Name = 0;
+        uintptr_t Id = 0;
+        uintptr_t CastFlags = 0;
+        uintptr_t ClassFlags = 0;
+        uintptr_t SuperClass = 0;
+        uintptr_t Size = 0;
+    } FFieldClass;
     struct
     {
         uintptr_t ArrayDim = 0;
@@ -117,7 +128,18 @@ struct UE_Offsets
         uintptr_t PropertyFlags = 0;
         uintptr_t Offset_Internal = 0;
         uintptr_t Size = 0;
+        // Offset to FProperty subclass tail data (e.g. FObjectPropertyBase::PropertyClass).
+        // Defaults to FProperty.Size; some games (DeltaForce) shift derived classes by an
+        // extra leading metadata pointer — prober writes the actual value back here.
+        uintptr_t SubPropertyBase = 0;
     } FProperty;
+    // FEnumProperty tail layout — order of UnderlyingType / Enum differs across builds.
+    // Walker previously probed it inline; prober now writes back so synthesize sees it.
+    struct
+    {
+        uintptr_t UnderlyingType = 0;  // pointer to FProperty
+        uintptr_t Enum = 0;            // pointer to UEnum
+    } FEnumProperty;
 
     std::string ToString() const;
 };
