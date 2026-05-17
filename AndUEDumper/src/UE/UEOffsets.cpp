@@ -482,6 +482,7 @@ namespace UE_DefaultOffsets
             offsets.UFunction.Func = offsets.UFunction.EFunctionFlags + (sizeof(int32_t) * 4) + (sizeof(void *) * 3);
 
             offsets.FField.ClassPrivate = sizeof(void *);
+            offsets.FField.Owner = offsets.FField.ClassPrivate + sizeof(void *);  // FFieldVariant after ClassPrivate
             offsets.FField.Next = offsets.FField.ClassPrivate + (sizeof(void *) * 3);  // + sizeof(FFieldVariant);
             offsets.FField.NamePrivate = offsets.FField.Next + sizeof(void *);
             offsets.FField.FlagsPrivate = offsets.FField.NamePrivate + offsets.FName.Size;
@@ -591,6 +592,7 @@ namespace UE_DefaultOffsets
             offsets.UFunction.Func = offsets.UFunction.EFunctionFlags + (sizeof(int32_t) * 4) + (sizeof(void *) * 3);
 
             offsets.FField.ClassPrivate = sizeof(void *);
+            offsets.FField.Owner = offsets.FField.ClassPrivate + sizeof(void *);  // FFieldVariant after ClassPrivate
             offsets.FField.Next = offsets.FField.ClassPrivate + sizeof(void *) + GetPtrAlignedOf(sizeof(void *) + sizeof(bool));  // + sizeof(FFieldVariant);
             offsets.FField.NamePrivate = offsets.FField.Next + sizeof(void *);
             offsets.FField.FlagsPrivate = offsets.FField.NamePrivate + offsets.FName.Size;

@@ -106,6 +106,7 @@ public:
             offsets.UFunction.Func = offsets.UFunction.EFunctionFlags + (sizeof(int32_t) * 2) + (sizeof(void *) * 3);
 
             offsets.FField.FlagsPrivate = sizeof(void *);
+            offsets.FField.Owner = sizeof(void *);  // DFM alt: Owner@0x8 (right after VTable)
             offsets.FField.Next = offsets.FField.FlagsPrivate + (sizeof(void *) * 2);
             offsets.FField.ClassPrivate = offsets.FField.Next + sizeof(void *);
             offsets.FField.NamePrivate = offsets.FField.ClassPrivate + sizeof(void *);

@@ -64,6 +64,7 @@ Phase B (augment):    现有的 fieldsFor / augment 逻辑统一作用于
 
 | 新增字段 | 含义 | 默认值 | 当前怎么决定 |
 |---|---|---|---|
+| `FField.Owner` | `FFieldVariant Owner` 字段位置（16 字节）| `FField.ClassPrivate + 8`（标准 4.25+，ClassPrivate-first）/ `8`（DFM，Owner-first） | prober `Phase5_ProbeFFieldOwner` 写回 |
 | `FProperty.SubPropertyBase` | FProperty 子类的额外字段相对 FField+FProperty 末尾的起点 | `FProperty.Size`（标准）/`FProperty.Size + 8`（DFM 派生类） | [`FindSubFPropertyBaseOffset`][2] 试探两次 |
 | `FEnumProperty.UnderlyingType` | `FEnumProperty::UnderlyingType` 相对 `object` 的偏移 | `FProperty.Size` | [`UE_FEnumProperty::GetUnderlayingProperty`][3] 试探 |
 | `FEnumProperty.Enum` | `FEnumProperty::Enum` 相对 `object` 的偏移 | `FProperty.Size + 8` | [`UE_FEnumProperty::GetEnum`][3] 试探 |
@@ -100,7 +101,7 @@ Phase B (augment):    现有的 fieldsFor / augment 逻辑统一作用于
 | 类型 | 字段 | 来源 | 注 |
 |---|---|---|---|
 | **FFieldVariant** | Container, bIsUObject | preamble 保留 | `{void*, bool}`，跨版本稳定 |
-| **FField** | VTable, Owner, Next, ClassPrivate, NamePrivate, FlagsPrivate | `UE_Offsets.FField.*` + VTable 强 emit `@0`；Owner 位置基于探到的 `ClassPrivate` 切两套：`ClassPrivate < 0x18` ⇒ Owner@0x10（UE 4.25+ 标准, ClassPrivate-first）、否则 Owner@0x8（DFM-style alt, Owner-first） | 字段顺序跨 layout 不同；augment 按 offset 排序后插 padding |
+| **FField** | VTable, Owner, Next, ClassPrivate, NamePrivate, FlagsPrivate | `UE_Offsets.FField.*` + VTable 强 emit `@0`；Owner 走 `UE_Offsets.FField.Owner`（prober Phase5_ProbeFFieldOwner 写回, 标准 4.25+ = ClassPrivate+8, DFM = 8） | 字段顺序跨 layout 不同；augment 按 offset 排序后插 padding |
 | **FFieldClass** | Name, Id, CastFlags, ClassFlags, SuperClass | `UE_Offsets.FFieldClass.*`（新增）| layout 跨版本稳定，但留扩展位 |
 
 ## 4. Synthesize 阶段 API 设计
@@ -209,11 +210,7 @@ if (cppName == "FFieldClass")
 else if (cppName == "FField")
 {
     add(0, 8, "void**", "VTable", true);
-    // Owner / ClassPrivate 两种排序。标准 4.25+ 是 ClassPrivate@0x8 + Owner@0x10，
-    // DFM-style alt 是 Owner@0x8 + ClassPrivate@0x20。用探到的 ClassPrivate 切：
-    // 任何 < 0x18 (= VTable + FFieldVariant) 都意味着 ClassPrivate 在 Owner 之前。
-    uintptr_t ownerOff = (offs.FField.ClassPrivate < 0x18) ? 0x10 : 0x8;
-    add(ownerOff,                       16,           "FFieldVariant",         "Owner", true);
+    add(offs.FField.Owner,              16,           "FFieldVariant",         "Owner");
     add(offs.FField.ClassPrivate,       8,            "struct FFieldClass*",   "ClassPrivate");
     add(offs.FField.Next,               8,            "struct FField*",        "Next");
     add(offs.FField.NamePrivate,        fnameSize,    "FName",                 "NamePrivate");

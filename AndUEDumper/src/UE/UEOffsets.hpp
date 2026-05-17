@@ -106,6 +106,9 @@ struct UE_Offsets
     struct
     {
         uintptr_t ClassPrivate = 0;
+        // FFieldVariant Owner. Standard UE 4.25+ puts it at ClassPrivate + 8;
+        // DFM-style alt puts it right after VTable (= 0x8). Plumbed by prober.
+        uintptr_t Owner = 0;
         uintptr_t Next = 0;
         uintptr_t NamePrivate = 0;
         uintptr_t FlagsPrivate = 0;

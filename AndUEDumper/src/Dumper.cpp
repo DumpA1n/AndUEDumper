@@ -655,13 +655,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             else if (cppName == "FField")
             {
                 add(0, 8, "void**", "VTable", true);
-                // Owner (FFieldVariant, 0x10) and ClassPrivate (FFieldClass*, 8)
-                // appear in either order. Standard UE 4.25+ is ClassPrivate@0x8 +
-                // Owner@0x10; DFM-style alt is Owner@0x8 + ClassPrivate@0x20.
-                // Probed ClassPrivate disambiguates: anything < 0x18 (= VTable +
-                // FFieldVariant) means ClassPrivate sits before Owner.
-                uintptr_t ownerOff = (offs.FField.ClassPrivate < 0x18) ? 0x10 : 0x8;
-                add(ownerOff,                       16,        "FFieldVariant",       "Owner", true);
+                add(offs.FField.Owner,              16,        "FFieldVariant",       "Owner");
                 add(offs.FField.ClassPrivate,       8,         "struct FFieldClass*", "ClassPrivate");
                 add(offs.FField.Next,               8,         "struct FField*",      "Next");
                 add(offs.FField.NamePrivate,        fnameSize, "FName",               "NamePrivate");
