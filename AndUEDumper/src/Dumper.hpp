@@ -85,6 +85,12 @@ private:
 
     void BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback);
 
+    // Inject empty Struct entries for non-UObject reflection metadata types
+    // (FField / FFieldClass / FProperty + 13 FProperty subclasses) into CoreUObject
+    // package. Members stay empty here; augment() fills them via fieldsFor().
+    // Runs after dropDups but before augment.
+    void SynthesizeReflectionTypes();
+
     void DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt);
 
     // Per-package SDK_A/<pkg>.hpp + SDK_A/SDK.hpp aggregator.

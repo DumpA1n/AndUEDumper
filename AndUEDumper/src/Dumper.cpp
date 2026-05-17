@@ -371,6 +371,104 @@ static std::vector<Node> TopoSort(const std::vector<Node> &nodes, DepsFn getDeps
     return out;
 }
 
+void UEDumper::SynthesizeReflectionTypes()
+{
+    // Find CoreUObject package; refuse to synthesize anywhere else.
+    UE_UPackage *corePkg = nullptr;
+    for (auto &p : _sdkProcessed)
+    {
+        if (p.PackageName == "CoreUObject")
+        {
+            corePkg = &p;
+            break;
+        }
+    }
+    if (!corePkg) return;
+
+    const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
+
+    // FField / FProperty layout only exists from UE 4.25+. If the profile
+    // didn't initialize FProperty.Size, this build has no FField at all.
+    if (offs.FProperty.Size == 0) return;
+
+    // Size table — needs to mirror §4.3 of docs/architecture/reflection-emit.md.
+    // Computed in topological order so child sizes can refer to parent sizes.
+    std::unordered_map<std::string, uint32_t> sizeOf;
+    auto align8 = [](uintptr_t v) -> uint32_t {
+        return static_cast<uint32_t>((v + 7) & ~uintptr_t(7));
+    };
+    sizeOf["FFieldClass"]         = static_cast<uint32_t>(offs.FFieldClass.Size);
+    sizeOf["FField"]              = align8(offs.FField.FlagsPrivate + sizeof(int32_t));
+    sizeOf["FProperty"]           = static_cast<uint32_t>(offs.FProperty.Size);
+    sizeOf["FStructProperty"]     = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FObjectPropertyBase"] = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FClassProperty"]      = sizeOf["FObjectPropertyBase"] + sizeof(void *);
+    sizeOf["FSoftClassProperty"]  = sizeOf["FClassProperty"];
+    sizeOf["FArrayProperty"]      = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FByteProperty"]       = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FBoolProperty"]       = align8(offs.FProperty.Size + 4);
+    sizeOf["FEnumProperty"]       = static_cast<uint32_t>(
+        std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum) + sizeof(void *));
+    sizeOf["FSetProperty"]        = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FMapProperty"]        = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *) * 2);
+    sizeOf["FInterfaceProperty"]  = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FFieldPathProperty"]  = static_cast<uint32_t>(offs.FProperty.Size + offs.FName.Size);
+    sizeOf["FDelegateProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FOptionalProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+
+    struct ReflectionType { const char *cppName; const char *parent; };
+    static constexpr ReflectionType kReflectionTypes[] = {
+        // FField hierarchy
+        { "FFieldClass",         "" },
+        { "FField",              "" },
+        { "FProperty",           "FField" },
+        // direct FProperty subclasses
+        { "FStructProperty",     "FProperty" },
+        { "FObjectPropertyBase", "FProperty" },
+        { "FArrayProperty",      "FProperty" },
+        { "FByteProperty",       "FProperty" },
+        { "FBoolProperty",       "FProperty" },
+        { "FEnumProperty",       "FProperty" },
+        { "FSetProperty",        "FProperty" },
+        { "FMapProperty",        "FProperty" },
+        { "FInterfaceProperty",  "FProperty" },
+        { "FFieldPathProperty",  "FProperty" },
+        { "FDelegateProperty",   "FProperty" },
+        { "FOptionalProperty",   "FProperty" },
+        // indirect (FObjectPropertyBase / FClassProperty)
+        { "FClassProperty",      "FObjectPropertyBase" },
+        { "FSoftClassProperty",  "FClassProperty" },
+    };
+
+    // Build a set of existing CppNameOnly in CoreUObject Structures to avoid dup insert.
+    std::unordered_set<std::string> existing;
+    existing.reserve(corePkg->Structures.size());
+    for (const auto &s : corePkg->Structures) existing.insert(s.CppNameOnly);
+
+    for (const auto &t : kReflectionTypes)
+    {
+        if (existing.count(t.cppName)) continue;
+
+        UE_UPackage::Struct s;
+        s.Name         = t.cppName;
+        s.FullName     = std::string("ScriptStruct CoreUObject.") + t.cppName;
+        s.CppNameOnly  = t.cppName;
+        s.SuperCppName = t.parent;
+        s.CppName      = std::string("struct ") + t.cppName;
+        if (t.parent[0] != '\0')
+        {
+            s.CppName += " : ";
+            s.CppName += t.parent;
+            auto pit = sizeOf.find(t.parent);
+            s.Inherited = pit != sizeOf.end() ? pit->second : 0;
+        }
+        s.Size = sizeOf[t.cppName];
+        // Members stays empty — augment() fills via fieldsFor() in next step.
+
+        corePkg->Structures.push_back(std::move(s));
+    }
+}
+
 void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback)
 {
     _sdkProcessed.clear();
@@ -462,6 +560,11 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         }
     }
 
+    // Synthesize FField / FProperty + subclasses into CoreUObject before augment.
+    // These types aren't UObjects so the walker never produces them; we mint empty
+    // Struct entries here and let augment() fill members from UE_Offsets.
+    SynthesizeReflectionTypes();
+
     // Augment core reflection classes (UObject/UField/UStruct/UEnum/UFunction/UClass):
     // stitch typed members back in over the opaque Pad_0xN[] regions the
     // property walker produces, using offsets from UE_Offsets.
@@ -525,6 +628,97 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 add(offs.UClass.CastFlags,     8, "EClassCastFlags", "CastFlags");
                 add(offs.UClass.DefaultObject, 8, "struct UObject*", "DefaultObject");
             }
+            // FField hierarchy (synthesized by SynthesizeReflectionTypes).
+            // All offsets here are members of a synthesized empty Struct; pass
+            // allowZeroOffset=true since legitimate offsets begin at 0 (e.g.
+            // FFieldClass::Name, FBoolProperty::FieldSize).
+            else if (cppName == "FFieldClass")
+            {
+                add(offs.FFieldClass.Name,       fnameSize, "FName",               "Name", true);
+                add(offs.FFieldClass.Id,         8,         "uint64_t",            "Id");
+                add(offs.FFieldClass.CastFlags,  8,         "uint64_t",            "CastFlags");
+                add(offs.FFieldClass.ClassFlags, 4,         "EClassFlags",         "ClassFlags");
+                add(offs.FFieldClass.SuperClass, 8,         "struct FFieldClass*", "SuperClass");
+            }
+            else if (cppName == "FField")
+            {
+                // VTable + Owner (FFieldVariant) are ABI-fixed; emit at known offsets.
+                add(0,                              8,         "void**",              "VTable", true);
+                add(8,                              16,        "FFieldVariant",       "Owner", true);
+                add(offs.FField.ClassPrivate,       8,         "struct FFieldClass*", "ClassPrivate");
+                add(offs.FField.Next,               8,         "struct FField*",      "Next");
+                add(offs.FField.NamePrivate,        fnameSize, "FName",               "NamePrivate");
+                add(offs.FField.FlagsPrivate,       4,         "int32_t",             "FlagsPrivate");
+            }
+            else if (cppName == "FProperty")
+            {
+                add(offs.FProperty.ArrayDim,        4, "int32_t",  "ArrayDim");
+                add(offs.FProperty.ElementSize,     4, "int32_t",  "ElementSize");
+                add(offs.FProperty.PropertyFlags,   8, "uint64_t", "PropertyFlags");
+                add(offs.FProperty.Offset_Internal, 4, "int32_t",  "Offset_Internal");
+            }
+            // FProperty subclasses — tail data lives at FProperty.SubPropertyBase.
+            else if (cppName == "FStructProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UStruct*", "Struct", true);
+            }
+            else if (cppName == "FObjectPropertyBase")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "PropertyClass", true);
+            }
+            else if (cppName == "FClassProperty")
+            {
+                add(offs.FProperty.SubPropertyBase + sizeof(void *), 8, "struct UClass*", "MetaClass", true);
+            }
+            else if (cppName == "FArrayProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "Inner", true);
+            }
+            else if (cppName == "FByteProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UEnum*", "Enum", true);
+            }
+            else if (cppName == "FBoolProperty")
+            {
+                // FBool tail is a stable 4-byte quartet at FProperty.Size, NOT
+                // SubPropertyBase — DFM-style leading metadata applies to pointer
+                // tail data (Struct/PropertyClass/Inner/...) not to FBool's bytes.
+                add(offs.FProperty.Size + 0, 1, "uint8_t", "FieldSize", true);
+                add(offs.FProperty.Size + 1, 1, "uint8_t", "ByteOffset", true);
+                add(offs.FProperty.Size + 2, 1, "uint8_t", "ByteMask", true);
+                add(offs.FProperty.Size + 3, 1, "uint8_t", "FieldMask", true);
+            }
+            else if (cppName == "FEnumProperty")
+            {
+                add(offs.FEnumProperty.UnderlyingType, 8, "struct FProperty*", "UnderlyingType", true);
+                add(offs.FEnumProperty.Enum,           8, "struct UEnum*",     "Enum", true);
+            }
+            else if (cppName == "FSetProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "ElementProp", true);
+            }
+            else if (cppName == "FMapProperty")
+            {
+                add(offs.FProperty.SubPropertyBase,                     8, "struct FProperty*", "KeyProp", true);
+                add(offs.FProperty.SubPropertyBase + sizeof(void *),    8, "struct FProperty*", "ValueProp", true);
+            }
+            else if (cppName == "FInterfaceProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "InterfaceClass", true);
+            }
+            else if (cppName == "FFieldPathProperty")
+            {
+                add(offs.FProperty.Size, fnameSize, "FName", "PropertyName", true);
+            }
+            else if (cppName == "FDelegateProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UFunction*", "SignatureFunction", true);
+            }
+            else if (cppName == "FOptionalProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "ValueProperty", true);
+            }
+            // FSoftClassProperty: no new fields beyond FClassProperty.
             return v;
         };
 
