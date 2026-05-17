@@ -860,8 +860,6 @@ public:
     uint64_t GetPropertyFlags() const;
     UEPropTypeInfo GetType() const;
     IFProperty GetInterface() const;
-
-    uintptr_t FindSubFPropertyBaseOffset() const;
 };
 
 class UE_FStructProperty : public UE_FProperty
