@@ -143,6 +143,25 @@ struct UE_Offsets
         uintptr_t UnderlyingType = 0;  // pointer to FProperty
         uintptr_t Enum = 0;            // pointer to UEnum
     } FEnumProperty;
+    // Per-subclass tail-pointer offsets. Defaults to FProperty.SubPropertyBase
+    // (so containers all share the base assumption); prober writes back the
+    // actually-probed per-class offset when it differs (DFM-style alt layouts
+    // where individual derived classes have their own leading-metadata pad).
+    // Runtime getters prefer these when non-zero, else fall back to
+    // SubPropertyBase, else runtime-probe.
+    struct
+    {
+        uintptr_t Inner = 0;  // pointer to FProperty
+    } FArrayProperty;
+    struct
+    {
+        uintptr_t ElementProp = 0;  // pointer to FProperty
+    } FSetProperty;
+    struct
+    {
+        uintptr_t KeyProp = 0;    // pointer to FProperty
+        uintptr_t ValueProp = 0;  // pointer to FProperty
+    } FMapProperty;
 
     std::string ToString() const;
 };

@@ -1357,9 +1357,43 @@ UEPropTypeInfo UE_FProperty::GetType() const
 
 IFProperty UE_FProperty::GetInterface() const { return IFProperty(this); }
 
+namespace
+{
+    // Returns the first candidate offset whose slot at `propObject + off` reads
+    // as a non-null pointer into mapped readable memory. Returns 0 if none.
+    //
+    // Used by FProperty-subclass tail getters as a fallback chain: per-subclass
+    // override (prober-written) → FProperty.SubPropertyBase → legacy slot probe
+    // (FProperty.Size / Size+8). Same lightweight validation the pre-99ece3c
+    // walker used, restored as a safety net for DFM-style alt layouts where
+    // individual derived classes have their own leading-metadata pad that
+    // the global SubPropertyBase value doesn't capture.
+    //
+    // Zero candidates are silently skipped (lets callers pass a per-subclass
+    // override that may be 0 when the prober didn't fill it in).
+    uintptr_t ResolveTailOffset(uintptr_t propObject, std::initializer_list<uintptr_t> candidates)
+    {
+        for (uintptr_t off : candidates)
+        {
+            if (off == 0) continue;
+            uintptr_t inner = 0;
+            if (!vm_rpm_ptr((void *)(propObject + off), &inner, sizeof(uintptr_t))) continue;
+            if (!inner) continue;
+            if (!kPtrValidator.isPtrReadable(inner)) continue;
+            return off;
+        }
+        return 0;
+    }
+}
+
 UE_UStruct UE_FStructProperty::GetStruct() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_UStruct>(object + off) : UE_UStruct();
 }
 
@@ -1370,7 +1404,12 @@ std::string UE_FStructProperty::GetTypeStr() const
 
 UE_UClass UE_FObjectPropertyBase::GetPropertyClass() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_UClass>(object + off) : UE_UClass();
 }
 
@@ -1381,7 +1420,13 @@ std::string UE_FObjectPropertyBase::GetTypeStr() const
 
 UE_FProperty UE_FArrayProperty::GetInner() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FArrayProperty.Inner,
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_FProperty>(object + off) : UE_FProperty();
 }
 
@@ -1392,7 +1437,12 @@ std::string UE_FArrayProperty::GetTypeStr() const
 
 UE_UEnum UE_FByteProperty::GetEnum() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     if (off == 0) return nullptr;
     auto e = vm_rpm_ptr<UE_UEnum>(object + off);
     return (e && e.IsA<UE_UEnum>()) ? e : nullptr;
@@ -1467,8 +1517,15 @@ std::string UE_FEnumProperty::GetTypeStr() const
 
 UE_UClass UE_FClassProperty::GetMetaClass() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
-    return off ? vm_rpm_ptr<UE_UClass>(object + off + sizeof(void *)) : UE_UClass();
+    const auto *offs = UEWrappers::GetOffsets();
+    // MetaClass lives at base + 8 (second slot after FObjectPropertyBase tail).
+    // ResolveTailOffset finds the *base*; we add sizeof(void*) to reach MetaClass.
+    uintptr_t base = ResolveTailOffset((uintptr_t)object, {
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
+    return base ? vm_rpm_ptr<UE_UClass>(object + base + sizeof(void *)) : UE_UClass();
 }
 
 std::string UE_FClassProperty::GetTypeStr() const
@@ -1484,7 +1541,13 @@ std::string UE_FSoftClassProperty::GetTypeStr() const
 
 UE_FProperty UE_FSetProperty::GetElementProp() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FSetProperty.ElementProp,
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_FProperty>(object + off) : UE_FProperty();
 }
 
@@ -1495,14 +1558,37 @@ std::string UE_FSetProperty::GetTypeStr() const
 
 UE_FProperty UE_FMapProperty::GetKeyProp() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FMapProperty.KeyProp,
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_FProperty>(object + off) : UE_FProperty();
 }
 
 UE_FProperty UE_FMapProperty::GetValueProp() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
-    return off ? vm_rpm_ptr<UE_FProperty>(object + off + sizeof(void *)) : UE_FProperty();
+    const auto *offs = UEWrappers::GetOffsets();
+    // ValueProp is the *second* slot. Try the per-subclass override directly,
+    // else derive from the resolved KeyProp base (+ sizeof(void*)).
+    if (offs->FMapProperty.ValueProp)
+    {
+        uintptr_t inner = 0;
+        if (vm_rpm_ptr((void *)(object + offs->FMapProperty.ValueProp), &inner, sizeof(uintptr_t))
+            && inner && kPtrValidator.isPtrReadable(inner))
+        {
+            return UE_FProperty((uint8_t *)inner);
+        }
+    }
+    uintptr_t base = ResolveTailOffset((uintptr_t)object, {
+        offs->FMapProperty.KeyProp,
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
+    return base ? vm_rpm_ptr<UE_FProperty>(object + base + sizeof(void *)) : UE_FProperty();
 }
 
 std::string UE_FMapProperty::GetTypeStr() const
@@ -1512,7 +1598,12 @@ std::string UE_FMapProperty::GetTypeStr() const
 
 UE_UClass UE_FInterfaceProperty::GetInterfaceClass() const
 {
-    const uintptr_t off = UEWrappers::GetOffsets()->FProperty.SubPropertyBase;
+    const auto *offs = UEWrappers::GetOffsets();
+    uintptr_t off = ResolveTailOffset((uintptr_t)object, {
+        offs->FProperty.SubPropertyBase,
+        offs->FProperty.Size,
+        offs->FProperty.Size + sizeof(void *),
+    });
     return off ? vm_rpm_ptr<UE_UClass>(object + off) : UE_UClass();
 }
 

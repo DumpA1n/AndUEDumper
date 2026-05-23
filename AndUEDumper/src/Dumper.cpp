@@ -404,13 +404,24 @@ void UEDumper::SynthesizeReflectionTypes()
     sizeOf["FObjectPropertyBase"] = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
     sizeOf["FClassProperty"]      = sizeOf["FObjectPropertyBase"] + sizeof(void *);
     sizeOf["FSoftClassProperty"]  = sizeOf["FClassProperty"];
-    sizeOf["FArrayProperty"]      = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    // Per-subclass override wins over global SubPropertyBase. Picks per-subclass
+    // when prober wrote it back (DFM-style alt layouts where individual derived
+    // classes have their own pad), else falls through to SubPropertyBase.
+    auto innerOff = [&](uintptr_t perSub, uintptr_t fallback) -> uintptr_t {
+        return perSub ? perSub : fallback;
+    };
+    const uintptr_t arrayInnerOff = innerOff(offs.FArrayProperty.Inner,    offs.FProperty.SubPropertyBase);
+    const uintptr_t setElemOff    = innerOff(offs.FSetProperty.ElementProp, offs.FProperty.SubPropertyBase);
+    const uintptr_t mapKeyOff     = innerOff(offs.FMapProperty.KeyProp,    offs.FProperty.SubPropertyBase);
+    const uintptr_t mapValueOff   = innerOff(offs.FMapProperty.ValueProp,  offs.FProperty.SubPropertyBase + sizeof(void *));
+
+    sizeOf["FArrayProperty"]      = static_cast<uint32_t>(arrayInnerOff + sizeof(void *));
     sizeOf["FByteProperty"]       = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
     sizeOf["FBoolProperty"]       = align8(offs.FProperty.Size + 4);
     sizeOf["FEnumProperty"]       = static_cast<uint32_t>(
         std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum) + sizeof(void *));
-    sizeOf["FSetProperty"]        = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FMapProperty"]        = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *) * 2);
+    sizeOf["FSetProperty"]        = static_cast<uint32_t>(setElemOff + sizeof(void *));
+    sizeOf["FMapProperty"]        = static_cast<uint32_t>(mapValueOff + sizeof(void *));
     sizeOf["FInterfaceProperty"]  = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
     sizeOf["FFieldPathProperty"]  = static_cast<uint32_t>(offs.FProperty.Size + offs.FName.Size);
     sizeOf["FDelegateProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
@@ -584,6 +595,18 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
         const uint32_t fnameSize = static_cast<uint32_t>(offs.FName.Size ? offs.FName.Size : 8);
 
+        // Per-subclass tail-offset resolution: prober-written value wins, else
+        // fall back to FProperty.SubPropertyBase. Mirrors the runtime fallback
+        // chain in UEWrappers.cpp so the synthesized struct layout matches the
+        // walker's actual read offsets.
+        auto innerOff = [&](uintptr_t perSub, uintptr_t fallback) -> uintptr_t {
+            return perSub ? perSub : fallback;
+        };
+        const uintptr_t arrayInnerOff = innerOff(offs.FArrayProperty.Inner,    offs.FProperty.SubPropertyBase);
+        const uintptr_t setElemOff    = innerOff(offs.FSetProperty.ElementProp, offs.FProperty.SubPropertyBase);
+        const uintptr_t mapKeyOff     = innerOff(offs.FMapProperty.KeyProp,    offs.FProperty.SubPropertyBase);
+        const uintptr_t mapValueOff   = innerOff(offs.FMapProperty.ValueProp,  offs.FProperty.SubPropertyBase + sizeof(void *));
+
         struct KnownField
         {
             uintptr_t Offset;
@@ -683,7 +706,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "FArrayProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "Inner", true);
+                add(arrayInnerOff, 8, "struct FProperty*", "Inner", true);
             }
             else if (cppName == "FByteProperty")
             {
@@ -706,12 +729,12 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "FSetProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "ElementProp", true);
+                add(setElemOff, 8, "struct FProperty*", "ElementProp", true);
             }
             else if (cppName == "FMapProperty")
             {
-                add(offs.FProperty.SubPropertyBase,                     8, "struct FProperty*", "KeyProp", true);
-                add(offs.FProperty.SubPropertyBase + sizeof(void *),    8, "struct FProperty*", "ValueProp", true);
+                add(mapKeyOff,   8, "struct FProperty*", "KeyProp",   true);
+                add(mapValueOff, 8, "struct FProperty*", "ValueProp", true);
             }
             else if (cppName == "FInterfaceProperty")
             {

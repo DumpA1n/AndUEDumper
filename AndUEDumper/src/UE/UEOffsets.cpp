@@ -217,6 +217,31 @@ std::string UE_Offsets::ToString() const
             kOUT_NEWLINE();
         }
 
+        kOUT_NS_BEGIN(FArrayProperty);
+        {
+            kOUT_NS_MEMBER_P(FArrayProperty, Inner);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FSetProperty);
+        {
+            kOUT_NS_MEMBER_P(FSetProperty, ElementProp);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FMapProperty);
+        {
+            kOUT_NS_MEMBER_P(FMapProperty, KeyProp);
+            kOUT_NS_MEMBER_P(FMapProperty, ValueProp);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
         kOUT_NS_END();
     }
 
@@ -506,6 +531,12 @@ namespace UE_DefaultOffsets
             offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
             offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
 
+            // Container tail defaults track SubPropertyBase (standard layout assumption).
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
+
             offsets.UProperty.ArrayDim = 0;
             offsets.UProperty.ElementSize = 0;
             offsets.UProperty.PropertyFlags = 0;
@@ -613,6 +644,11 @@ namespace UE_DefaultOffsets
 
             offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
             offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
+
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
         }
         return offsets;
     }
@@ -639,6 +675,11 @@ namespace UE_DefaultOffsets
             // FProperty.Size shifted relative to UE5_00_02; re-sync FEnumProperty tail.
             offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
             offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
+
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
         }
         return offsets;
     }
