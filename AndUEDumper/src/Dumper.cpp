@@ -1154,9 +1154,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 }
 
 
-static void EmitSDKFunctionsCppBodies(BufferFmt &buf, int processEventIndex)
+static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
 {
-    buf.append("constexpr int kProcessEventIndex = {};\n\n", processEventIndex);
     buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 {
     using FN = void(*)(const UObject*, struct UFunction*, void*);
@@ -1490,6 +1489,8 @@ static void EmitSDKCoreFiles(
         buf.append("#include \"CoreUObject_structs.hpp\"\n\n");
         buf.append("namespace SDK\n{{\n\n");
 
+        buf.append("constexpr int kProcessEventIndex = {};\n\n", processEventIndex);
+
         buf.append("// Package: CoreUObject - Classes({})\n\n", corePkg.Classes.size());
 
         if (!corePkg.Classes.empty())
@@ -1506,7 +1507,7 @@ static void EmitSDKCoreFiles(
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
         buf.append("namespace SDK\n{{\n\n");
-        EmitSDKFunctionsCppBodies(buf, processEventIndex);
+        EmitSDKFunctionsCppBodies(buf);
         EmitUClassGetFunctionBody(buf, /*emitInline=*/false);
         EmitPackageFunctionBodies(buf, corePkg, /*emitInline=*/false, enumUnderlying);
         buf.append("}} // namespace SDK\n");
