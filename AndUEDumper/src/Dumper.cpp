@@ -16,6 +16,7 @@ using namespace UEMemory;
 #include "UPackageGenerator.hpp"
 #include "UECoreEmbed.hpp"
 #include "UtfcppEmbed.hpp"
+#include "SDKCoreGen.hpp"
 
 #define kVECTOR_CONTAINS(vec, val) (std::find(vec.begin(), vec.end(), val) != vec.end())
 
@@ -1414,18 +1415,6 @@ static std::string StripUtf8Bom(std::string content)
     return content;
 }
 
-// patch bWITH_CASE_PRESERVING_NAME from per-game profile (8B union -> 12B fields)
-static std::string ApplyCasePreservingDefine(std::string content, bool casePreserving)
-{
-    if (!casePreserving) return content;
-    const std::string from = "#define bWITH_CASE_PRESERVING_NAME false";
-    const std::string to   = "#define bWITH_CASE_PRESERVING_NAME true";
-    auto pos = content.find(from);
-    if (pos != std::string::npos)
-        content.replace(pos, from.size(), to);
-    return content;
-}
-
 // retarget Basic.cpp's CoreUObject_classes.h include to .hpp
 static std::string RetargetBasicCppIncludes(std::string content)
 {
@@ -1441,12 +1430,12 @@ static void EmitSDKCoreFiles(
     const std::string& prefix,
     const UE_UPackage& corePkg,
     int processEventIndex,
-    bool casePreserving,
+    const sdkcoregen::FNameLayout& fnameLayout,
     const std::unordered_map<std::string, std::string>& enumUnderlying,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
     outBuffersMap[prefix + "Basic.h"].append("{}",
-        StripUtf8Bom(ApplyCasePreservingDefine(kUECoreBasicH, casePreserving)));
+        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout)));
     outBuffersMap[prefix + "Basic.cpp"].append("{}",
         RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
@@ -1595,11 +1584,18 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     const std::string prefix = "SDK_A/";
     const std::string pkgPrefix = prefix + "Packages/";
 
-    const bool casePreserving =
-        _profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets()
-            ? _profile->GetUEVars()->GetOffsets()->Config.isUsingCasePreservingName
-            : false;
-    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, casePreserving, _sdkEnumUnderlying, outBuffersMap);
+    sdkcoregen::FNameLayout fnameLayout;  // defaults: 8B, non-CP, non-outline (Cmp@0, Number@4)
+    if (_profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets())
+    {
+        const UE_Offsets& o = *_profile->GetUEVars()->GetOffsets();
+        fnameLayout = {o.FName.Size ? static_cast<int32_t>(o.FName.Size) : 8,
+                       static_cast<int32_t>(o.FName.ComparisonIndex),
+                       static_cast<int32_t>(o.FName.DisplayIndex),
+                       static_cast<int32_t>(o.FName.Number),
+                       o.Config.isUsingCasePreservingName,
+                       o.Config.isUsingOutlineNumberName};
+    }
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, _sdkEnumUnderlying, outBuffersMap);
 
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)

@@ -280,66 +280,8 @@ public:
 	}
 };
 
-class FName final
-{
-public:
-	static inline std::function<std::string(int32_t)> s_NameResolver;
-
-#define bWITH_CASE_PRESERVING_NAME false
-#if !bWITH_CASE_PRESERVING_NAME
-	union {
-#endif
-	int32                                         ComparisonIndex;                                   // 0x0000(0x0004)(NOT AUTO-GENERATED PROPERTY)
-	int32                                         DisplayIndex;                                      // 0x0004(0x0004)(NOT AUTO-GENERATED PROPERTY)
-#if !bWITH_CASE_PRESERVING_NAME
-	};
-#endif
-	uint32                                        Number;                                            // 0x0008(0x0004)(NOT AUTO-GENERATED PROPERTY)
-
-public:
-	int32 GetDisplayIndex() const
-	{
-		return DisplayIndex;
-	}
-
-	static std::string GetPlainANSIString(const FName* Name)
-	{
-		if (s_NameResolver)
-			return s_NameResolver(Name->ComparisonIndex);
-		return {};
-	}
-
-	std::string GetRawString() const
-	{
-		return GetPlainANSIString(this);
-	}
-	
-	std::string ToString() const
-	{
-		std::string OutputString = GetRawString();
-	
-		size_t pos = OutputString.rfind('/');
-	
-		if (pos == std::string::npos)
-			return OutputString;
-	
-		return OutputString.substr(pos + 1);
-	}
-
-	const char* ToCString() const
-	{
-		return ToString().c_str();
-	}
-	
-	bool operator==(const FName& Other) const
-	{
-		return ComparisonIndex == Other.ComparisonIndex && Number == Other.Number;
-	}
-	bool operator!=(const FName& Other) const
-	{
-		return ComparisonIndex != Other.ComparisonIndex || Number != Other.Number;
-	}
-};
+// FName + FName-sized core types are generated per-game from UE_Offsets; see SDKCoreGen.hpp.
+// @@SDK_GEN_FNAME@@
 
 template<typename ClassType>
 class TSubclassOf
@@ -526,24 +468,7 @@ public:
 	}
 };
 
-namespace FakeSoftObjectPtr
-{
-
-// ScriptStruct CoreUObject.SoftObjectPath
-// 0x0020 (0x0020 - 0x0000)
-struct FSoftObjectPath
-{
-public:
-	class FName                                   AssetPathName;                                     // 0x0000(0x000C)(ZeroConstructor, IsPlainOldData, NoDestructor, HasGetValueTypeHash, NativeAccessSpecifierPublic)
-	uint8                                         Pad_C[0x4];                                        // 0x000C(0x0004)(Fixing Size After Last Property [ Dumper-7 ])
-	class FString                                 SubPathString;                                     // 0x0010(0x0010)(ZeroConstructor, HasGetValueTypeHash, NativeAccessSpecifierPublic)
-};
-static_assert(alignof(FSoftObjectPath) == 0x000008, "Wrong alignment on FSoftObjectPath");
-static_assert(sizeof(FSoftObjectPath) == 0x000020, "Wrong size on FSoftObjectPath");
-static_assert(offsetof(FSoftObjectPath, AssetPathName) == 0x000000, "Member 'FSoftObjectPath::AssetPathName' has a wrong offset!");
-static_assert(offsetof(FSoftObjectPath, SubPathString) == 0x000010, "Member 'FSoftObjectPath::SubPathString' has a wrong offset!");
-
-}
+// @@SDK_GEN_FSOFTOBJECTPATH@@
 
 class FSoftObjectPtr : public TPersistentObjectPtr<FakeSoftObjectPtr::FSoftObjectPath>
 {
@@ -696,18 +621,7 @@ public:
 };
 
 
-// Predefined struct FScriptDelegate
-// 0x0014 (0x0014 - 0x0000)
-struct FScriptDelegate
-{
-public:
-	FWeakObjectPtr                                Object;                                            // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
-	FName                                         FunctionName;                                      // 0x0008(0x000C)(NOT AUTO-GENERATED PROPERTY)
-};
-static_assert(alignof(FScriptDelegate) == 0x000004, "Wrong alignment on FScriptDelegate");
-static_assert(sizeof(FScriptDelegate) == 0x000010, "Wrong size on FScriptDelegate");
-static_assert(offsetof(FScriptDelegate, Object) == 0x000000, "Member 'FScriptDelegate::Object' has a wrong offset!");
-static_assert(offsetof(FScriptDelegate, FunctionName) == 0x000008, "Member 'FScriptDelegate::FunctionName' has a wrong offset!");
+// @@SDK_GEN_FSCRIPTDELEGATE@@
 
 // Predefined delegate placeholder structs. The dumper synthesizes these
 // names from FProperty kinds in per-package SDK output (e.g. dumped fields
