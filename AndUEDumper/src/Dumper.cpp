@@ -815,6 +815,20 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
             s.Members = std::move(rebuilt);
 
+            // Self-validating layout guard for the synthesized core types. The members above
+            // are placed at offsets from UE_Offsets with gaps padded; if those offsets are
+            // inconsistent with a member's declared size (e.g. FName=0xC vs a FlagsPrivate
+            // computed for 0x8 — which silently shifts FProperty::Offset_Internal and breaks
+            // reflection), the emitted C++ struct's sizeof diverges from the dumped size.
+            // Emit a static_assert so that mismatch fails to COMPILE instead of resolving
+            // wrong offsets at runtime. Only for 8-aligned dumped sizes — pointer-bearing
+            // structs whose C++ sizeof equals the dumped size; non-aligned tails (FBoolProperty,
+            // FFieldPathProperty) round up under C++ alignment and would false-trip.
+            if (s.Size && (s.Size % 8 == 0))
+                s.Trailer = fmt::format(
+                    "static_assert(sizeof({}) == 0x{:X}, \"{} layout mismatch vs dumped size — re-dump SDK\");",
+                    s.CppNameOnly, s.Size, s.CppNameOnly);
+
             if (s.CppNameOnly == "UObject")
             {
                 s.PrefixDecls = "\tstatic inline class TUObjectArrayWrapper GObjects;\n";

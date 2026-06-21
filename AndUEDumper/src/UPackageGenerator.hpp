@@ -64,6 +64,8 @@ public:
         std::string ExtraDecls;
         // extra C++ prepended before Members (e.g. DEFINE_UE_CLASS_HELPERS, GObjects)
         std::string PrefixDecls;
+        // C++ appended AFTER the struct's closing brace (e.g. layout static_asserts)
+        std::string Trailer;
     };
     struct Enum
     {

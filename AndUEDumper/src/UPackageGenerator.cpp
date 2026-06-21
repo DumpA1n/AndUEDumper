@@ -622,7 +622,10 @@ void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBu
                 pBufFmt->append("\n");
         }
 
-        pBufFmt->append("\n}};\n\n");
+        pBufFmt->append("\n}};\n");
+        if (!s.Trailer.empty())
+            pBufFmt->append("{}\n", s.Trailer);
+        pBufFmt->append("\n");
     }
 }
 
