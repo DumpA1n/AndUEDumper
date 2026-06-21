@@ -78,7 +78,7 @@ std::vector<IGameProfile *> UE_Games = {
     new PUBGProfile(),
 };
 
-#define kPROGRAM_VER "4.3.2"
+#define kPROGRAM_VER "4.3.3"
 
 // increase if needed
 #define WAIT_TIME_SEC 20

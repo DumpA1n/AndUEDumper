@@ -11,7 +11,7 @@
 
 #include <argsparse/argsparse.hpp>
 #define kPROGRAM_NAME "UEDump3r"
-#define kPROGRAM_VER "4.3.2"
+#define kPROGRAM_VER "4.3.3"
 
 #include "Utils/Logger.hpp"
 #include "Utils/ProgressUtils.hpp"
