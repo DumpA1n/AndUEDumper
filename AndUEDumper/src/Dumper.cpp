@@ -413,7 +413,7 @@ void UEDumper::SynthesizeReflectionTypes()
     };
     const uintptr_t arrayInnerOff = innerOff(offs.FArrayProperty.Inner,    offs.FProperty.SubPropertyBase);
     const uintptr_t setElemOff    = innerOff(offs.FSetProperty.ElementProp, offs.FProperty.SubPropertyBase);
-    const uintptr_t mapKeyOff     = innerOff(offs.FMapProperty.KeyProp,    offs.FProperty.SubPropertyBase);
+    [[maybe_unused]] const uintptr_t mapKeyOff = innerOff(offs.FMapProperty.KeyProp, offs.FProperty.SubPropertyBase);  // size uses mapValueOff (last elem)
     const uintptr_t mapValueOff   = innerOff(offs.FMapProperty.ValueProp,  offs.FProperty.SubPropertyBase + sizeof(void *));
 
     sizeOf["FArrayProperty"]      = static_cast<uint32_t>(arrayInnerOff + sizeof(void *));
