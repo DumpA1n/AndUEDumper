@@ -1,5 +1,117 @@
 #pragma once
 
+static const char* kUECoreUEAssertH = R"UEASSERT(#pragma once
+
+#include <cstdint>
+#include <cstdio>
+
+#if defined(__ANDROID__)
+	#include <android/log.h>
+	#ifndef UE_ASSERT_LOG_TAG
+		#define UE_ASSERT_LOG_TAG "INJECT"
+	#endif
+	#define UE_ASSERT_LOG(...) __android_log_print(ANDROID_LOG_FATAL, UE_ASSERT_LOG_TAG, __VA_ARGS__)
+#else
+	#define UE_ASSERT_LOG(...) (std::fprintf(stderr, __VA_ARGS__), std::fprintf(stderr, "\n"))
+#endif
+
+#if defined(__FILE_NAME__)
+	#define UE_ASSERT_FILE __FILE_NAME__
+#else
+	#define UE_ASSERT_FILE __FILE__
+#endif
+
+// SDK strings are ANSI (char); TEXT() is identity. checkf/checkfSlow use it.
+#ifndef TEXT
+	#define TEXT(x) x
+#endif
+
+#ifndef DO_CHECK
+	#define DO_CHECK 1
+#endif
+
+#if DO_CHECK
+	#ifndef check
+		#define check(expr) \
+			do { if (!(expr)) { \
+				UE_ASSERT_LOG("Assertion failed: %s [%s:%d] %s", #expr, UE_ASSERT_FILE, __LINE__, __FUNCTION__); \
+				__builtin_trap(); \
+			} } while (0)
+	#endif
+	#ifndef checkf
+		#define checkf(expr, fmt, ...) \
+			do { if (!(expr)) { \
+				UE_ASSERT_LOG("Assertion failed: %s [%s:%d] %s: " fmt, #expr, UE_ASSERT_FILE, __LINE__, __FUNCTION__, ##__VA_ARGS__); \
+				__builtin_trap(); \
+			} } while (0)
+	#endif
+#else
+	#ifndef check
+		#define check(expr) ((void)0)
+	#endif
+	#ifndef checkf
+		#define checkf(expr, fmt, ...) ((void)0)
+	#endif
+#endif
+
+#ifndef verify
+	#if DO_CHECK
+		#define verify(expr) check(expr)
+	#else
+		#define verify(expr) do { if (expr) {} } while (0)
+	#endif
+#endif
+#ifndef verifyf
+	#if DO_CHECK
+		#define verifyf(expr, fmt, ...) checkf(expr, fmt, ##__VA_ARGS__)
+	#else
+		#define verifyf(expr, fmt, ...) do { if (expr) {} } while (0)
+	#endif
+#endif
+
+#ifndef checkNoEntry
+	#define checkNoEntry() check(!"checkNoEntry: enclosing block should never be called")
+#endif
+#ifndef unimplemented
+	#define unimplemented() check(!"unimplemented: function not implemented")
+#endif
+
+#if DO_CHECK && defined(DO_GUARD_SLOW)
+	#ifndef checkSlow
+		#define checkSlow(expr) check(expr)
+	#endif
+	#ifndef checkfSlow
+		#define checkfSlow(expr, fmt, ...) checkf(expr, fmt, ##__VA_ARGS__)
+	#endif
+#else
+	#ifndef checkSlow
+		#define checkSlow(expr) ((void)0)
+	#endif
+	#ifndef checkfSlow
+		#define checkfSlow(expr, fmt, ...) ((void)0)
+	#endif
+#endif
+
+#ifndef ensure
+	#define ensure(expr) \
+		([](bool _bCond, const char* _fn) -> bool { \
+			static bool _bLogged = false; \
+			if (!_bCond && !_bLogged) { _bLogged = true; \
+				UE_ASSERT_LOG("Ensure failed: %s [%s:%d] %s", #expr, UE_ASSERT_FILE, __LINE__, _fn); } \
+			return _bCond; \
+		}(!!(expr), __FUNCTION__))
+#endif
+#ifndef ensureMsgf
+	#define ensureMsgf(expr, fmt, ...) \
+		([&](bool _bCond, const char* _fn) -> bool { \
+			static bool _bLogged = false; \
+			if (!_bCond && !_bLogged) { _bLogged = true; \
+				UE_ASSERT_LOG("Ensure failed: %s [%s:%d] %s: " fmt, #expr, UE_ASSERT_FILE, __LINE__, _fn, ##__VA_ARGS__); } \
+			return _bCond; \
+		}(!!(expr), __FUNCTION__))
+#endif
+)UEASSERT";
+
 static const char* kUECoreBasicH = R"UECoreBasicH(
 #pragma once
 
@@ -9,6 +121,7 @@ static const char* kUECoreBasicH = R"UECoreBasicH(
 #include <functional>
 #include <type_traits>
 
+#include "UEAssert.h"
 #include "UnrealContainers.h"
 
 namespace SDK {
@@ -27,7 +140,9 @@ namespace InSDKUtils
 	template<typename FuncType>
 	inline FuncType GetVirtualFunction(const void* ObjectInstance, int32 Index)
 	{
+		check(ObjectInstance);
 		void** VTable = *reinterpret_cast<void***>(const_cast<void*>(ObjectInstance));
+		check(VTable);
 
 		return reinterpret_cast<FuncType>(VTable[Index]);
 	}
@@ -94,6 +209,7 @@ class UClass* StaticClassImpl()
 		else /* default */ {
 			Clss = BasicFilesImpleUtils::FindClassByName(Name);
 		}
+		ensureMsgf(Clss, "StaticClassImpl: class \"%s\" not found", Name.Chars);
 	}
 
 	return Clss;
@@ -151,7 +267,9 @@ class UClass* StaticBPGeneratedClassImpl()
 template<class ClassType>
 ClassType* GetDefaultObjImpl()
 {
-	return reinterpret_cast<ClassType*>(ClassType::StaticClass()->DefaultObject);
+	auto* Clss = ClassType::StaticClass();
+	check(Clss);
+	return reinterpret_cast<ClassType*>(Clss->DefaultObject);
 }
 
 template <typename To, typename From>
@@ -166,119 +284,9 @@ inline To* Cast(From* Src)
 	return nullptr;
 }
 
-struct FUObjectItem final
-{
-public:
-	class UObject*                                Object;                                            // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
-	uint8                                         Pad_8[0x10];                                       // 0x0008(0x0010)(Fixing Struct Size After Last Property [ Dumper-7 ])
-};
-
-class TUObjectArray final
-{
-public:
-	static constexpr auto DecryptPtr = [](void* ObjPtr) -> uint8*
-	{
-		return reinterpret_cast<uint8*>(ObjPtr);
-	};
-
-	static inline int32                           NumElementsPerChunk = 0x10000;
-
-	struct FUObjectItem**                         Objects;                                           // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
-	uint8                                         Pad_8[0x8];                                        // 0x0008(0x0008)(Fixing Size After Last Property [ Dumper-7 ])
-	int32                                         MaxElements;                                       // 0x0010(0x0004)(NOT AUTO-GENERATED PROPERTY)
-	int32                                         NumElements;                                       // 0x0014(0x0004)(NOT AUTO-GENERATED PROPERTY)
-	int32                                         MaxChunks;                                         // 0x0018(0x0004)(NOT AUTO-GENERATED PROPERTY)
-	int32                                         NumChunks;                                         // 0x001C(0x0004)(NOT AUTO-GENERATED PROPERTY)
-
-public:
-	inline int32 Num() const
-	{
-		return NumElements;
-	}
-
-	FUObjectItem** GetDecryptedObjPtr() const
-	{
-		return reinterpret_cast<FUObjectItem**>(DecryptPtr(Objects));
-	}
-
-	inline class UObject* GetByIndex(const int32 Index) const
-	{
-		if (Index < 0 || Index >= NumElements || !Objects)
-			return nullptr;
-
-		if (NumElementsPerChunk <= 0)
-			return *reinterpret_cast<UObject**>((uintptr_t)Objects + Index * sizeof(FUObjectItem) + offsetof(FUObjectItem, Object));
-
-		const int32_t ChunkIndex = Index / NumElementsPerChunk;
-		const int32_t WithinChunkIndex = Index % NumElementsPerChunk;
-
-		// if (ChunkIndex >= NumChunks) return nullptr;
-
-		uint64_t chunk = *reinterpret_cast<uint64_t*>(Objects + ChunkIndex);
-		if (!chunk)
-			return nullptr;
-
-		return *reinterpret_cast<UObject**>(chunk + (WithinChunkIndex * sizeof(FUObjectItem)) + offsetof(FUObjectItem, Object));
-	}
-
-	void ForEachObject(const std::function<bool(UObject*)> &callback) const
-	{
-		if (!callback) return;
-
-		for (int32_t i = 0; i < NumElements; i++)
-		{
-			UObject* object = GetByIndex(i);
-			if (!object) continue;
-
-			if (callback(object)) return;
-		}
-	}
-};
-
-struct TUObjectArrayWrapper
-{
-private:
-	friend class UObject;
-
-private:
-	void* GObjectsAddress = nullptr;
-
-private:
-	TUObjectArrayWrapper() = default;
-
-public:
-	TUObjectArrayWrapper(TUObjectArrayWrapper&&) = delete;
-	TUObjectArrayWrapper(const TUObjectArrayWrapper&) = delete;
-
-	TUObjectArrayWrapper& operator=(TUObjectArrayWrapper&&) = delete;
-	TUObjectArrayWrapper& operator=(const TUObjectArrayWrapper&) = delete;
-
-public:
-	inline void InitManually(void* GObjectsAddressParameter)
-	{
-		GObjectsAddress = GObjectsAddressParameter;
-	}
-
-	inline class TUObjectArray* operator->()
-	{
-		return reinterpret_cast<class TUObjectArray*>(GObjectsAddress);
-	}
-
-	inline TUObjectArray& operator*() const
-	{
-		return *reinterpret_cast<class TUObjectArray*>(GObjectsAddress);
-	}
-
-	inline operator const void* ()
-	{
-		return GObjectsAddress;
-	}
-
-	inline class TUObjectArray* GetTypedPtr()
-	{
-		return reinterpret_cast<class TUObjectArray*>(GObjectsAddress);
-	}
-};
+// Canonical UE object array (FUObjectItem / FFixedUObjectArray / FChunkedFixedUObjectArray /
+// FUObjectArray + extern GUObjectArray) generated per-game from UE_Offsets; see SDKCoreGen.hpp.
+// @@SDK_GEN_UOBJECTARRAY@@
 
 // FName + FName-sized core types are generated per-game from UE_Offsets; see SDKCoreGen.hpp.
 // @@SDK_GEN_FNAME@@
@@ -1004,6 +1012,13 @@ static const char* kUECoreBasicCpp = R"UECoreBasicCpp(
 namespace SDK
 {
 
+FUObjectArray GUObjectArray;
+
+int32 FUObjectArray::ObjectToIndex(const class UObject* Object) const
+{
+	return Object->InternalIndex;
+}
+
 class UClass* BasicFilesImpleUtils::FindClassByName(const std::string& Name)
 {
 	return UObject::FindClassFast(Name);
@@ -1031,14 +1046,16 @@ uint64 BasicFilesImpleUtils::GetObjFNameAsUInt64(class UClass* Class)
 
 class UObject* BasicFilesImpleUtils::GetObjectByIndex(int32 Index)
 {
-	return UObject::GObjects->GetByIndex(Index);
+	FUObjectItem* Item = GUObjectArray.IndexToObject(Index);
+	return Item ? Item->Object : nullptr;
 }
 
 UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 {
-	for (int i = 0; i < UObject::GObjects->Num(); ++i)
+	for (int i = 0; i < GUObjectArray.GetObjectArrayNum(); ++i)
 	{
-		UObject* Object = UObject::GObjects->GetByIndex(i);
+		FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+		UObject* Object = Item ? Item->Object : nullptr;
 
 		if (!Object)
 			continue;
@@ -1055,7 +1072,8 @@ UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 
 class UObject* FWeakObjectPtr::Get() const
 {
-	return UObject::GObjects->GetByIndex(ObjectIndex);
+	FUObjectItem* Item = GUObjectArray.IndexToObject(ObjectIndex);
+	return Item ? Item->Object : nullptr;
 }
 
 
@@ -1063,7 +1081,8 @@ class UObject* FWeakObjectPtr::Get() const
 
 class UObject* FWeakObjectPtr::operator->() const
 {
-	return UObject::GObjects->GetByIndex(ObjectIndex);
+	FUObjectItem* Item = GUObjectArray.IndexToObject(ObjectIndex);
+	return Item ? Item->Object : nullptr;
 }
 
 

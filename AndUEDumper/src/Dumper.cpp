@@ -831,7 +831,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
             if (s.CppNameOnly == "UObject")
             {
-                s.PrefixDecls = "\tstatic inline class TUObjectArrayWrapper GObjects;\n";
+                s.PrefixDecls = "";
                 s.ExtraDecls =
                     "\tvoid ProcessEvent(struct UFunction* Function, void* Parms) const;\n"
                     "\n"
@@ -1174,17 +1174,19 @@ static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
     buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 {
     using FN = void(*)(const UObject*, struct UFunction*, void*);
+    check(Function);
     auto vtbl = *reinterpret_cast<void* const* const*>(this);
+    check(vtbl);
     reinterpret_cast<FN>(vtbl[kProcessEventIndex])(this, Function, Parms);
 }
 
 class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
 {
-    if (!GObjects) return nullptr;
-    const int32_t N = GObjects->Num();
+    const int32_t N = GUObjectArray.GetObjectArrayNum();
     for (int32_t i = 0; i < N; ++i)
     {
-        UObject* Object = GObjects->GetByIndex(i);
+        FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+        UObject* Object = Item ? Item->Object : nullptr;
         if (!Object || (reinterpret_cast<uintptr_t>(Object) & 0x7) != 0)
             continue;
         if (Object->HasTypeFlag(RequiredType) && Object->GetFullName() == FullName)
@@ -1195,11 +1197,11 @@ class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFl
 
 class UObject* UObject::FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType)
 {
-    if (!GObjects) return nullptr;
-    const int32_t N = GObjects->Num();
+    const int32_t N = GUObjectArray.GetObjectArrayNum();
     for (int32_t i = 0; i < N; ++i)
     {
-        UObject* Object = GObjects->GetByIndex(i);
+        FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+        UObject* Object = Item ? Item->Object : nullptr;
         if (!Object) continue;
         if (Object->HasTypeFlag(RequiredType) && Object->GetName() == Name)
             return Object;
@@ -1445,14 +1447,16 @@ static void EmitSDKCoreFiles(
     const UE_UPackage& corePkg,
     int processEventIndex,
     const sdkcoregen::FNameLayout& fnameLayout,
+    const sdkcoregen::UObjectArrayLayout& uobjArrayLayout,
     const std::unordered_map<std::string, std::string>& enumUnderlying,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
     outBuffersMap[prefix + "Basic.h"].append("{}",
-        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout)));
+        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout)));
     outBuffersMap[prefix + "Basic.cpp"].append("{}",
         RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
+    outBuffersMap[prefix + "UEAssert.h"].append("{}", StripUtf8Bom(kUECoreUEAssertH));
 
     // utfcpp shipped under <prefix>utfcpp/ so SDK is self-contained
     outBuffersMap[prefix + "utfcpp/core.h"].append("{}", StripUtf8Bom(kUtfcppCoreH));
@@ -1499,13 +1503,13 @@ static void EmitSDKCoreFiles(
         if (!corePkg.Classes.empty())
             UE_UPackage::AppendStructsToBuffer(const_cast<std::vector<UE_UPackage::Struct>&>(corePkg.Classes), &buf);
 
-        buf.append("\n}} // namespace SDK\n");
+        buf.append("}} // namespace SDK\n");
     }
 
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
         buf.append("// Bodies for UObject helpers + UFunction dispatch.\n");
-        buf.append("// Wire FName::s_NameResolver and UObject::GObjects at startup.\n\n");
+        buf.append("// Wire FName::s_NameResolver and GUObjectArray.InitManually() at startup.\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
@@ -1599,6 +1603,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     const std::string pkgPrefix = prefix + "Packages/";
 
     sdkcoregen::FNameLayout fnameLayout;  // defaults: 8B, non-CP, non-outline (Cmp@0, Number@4)
+    sdkcoregen::UObjectArrayLayout uobjArrayLayout;  // defaults: stride 0x18, Object@0, chunked 64K
     if (_profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets())
     {
         const UE_Offsets& o = *_profile->GetUEVars()->GetOffsets();
@@ -1608,8 +1613,11 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                        static_cast<int32_t>(o.FName.Number),
                        o.Config.isUsingCasePreservingName,
                        o.Config.isUsingOutlineNumberName};
+        uobjArrayLayout = {o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18,
+                           static_cast<int32_t>(o.FUObjectItem.Object),
+                           static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk)};
     }
-    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, _sdkEnumUnderlying, outBuffersMap);
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, _sdkEnumUnderlying, outBuffersMap);
 
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)
