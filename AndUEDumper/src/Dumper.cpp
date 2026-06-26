@@ -433,6 +433,11 @@ void UEDumper::SynthesizeReflectionTypes()
         // FField hierarchy
         { "FFieldClass",         "" },
         { "FField",              "" },
+        // FProperty : FField. FField is emitted non-POD (~FField(){} + no trailing
+        // pad, see augment) so the Itanium ABI lets FProperty pack ArrayDim into
+        // FField's [0x34,0x38) tail padding — matching real UE. Inherited is set to
+        // FField's DATA extent (0x34), not sizeof (0x38). NDK/Itanium only: MSVC
+        // never reuses base tail padding (would shift ArrayDim to 0x38).
         { "FProperty",           "FField" },
         // direct FProperty subclasses
         { "FStructProperty",     "FProperty" },
@@ -473,19 +478,13 @@ void UEDumper::SynthesizeReflectionTypes()
             s.CppName += t.parent;
             auto pit = sizeOf.find(t.parent);
             s.Inherited = pit != sizeOf.end() ? pit->second : 0;
-            // UE 4.25+ standard layout packs FProperty.ArrayDim into FField's
-            // trailing 4-byte alignment pad (probe finds ArrayDim @ 0x34, but
-            // sizeOf[FField] = align8(FlagsPrivate + 4) = 0x38). augment erases
-            // any field with offset < Inherited, so without this clamp the
-            // dump silently drops ArrayDim. DFM-style alt layout (ArrayDim
-            // already at 0x38) is unaffected because the min(...) is a no-op.
-            if (std::string(t.cppName) == "FProperty"
-                && offs.FProperty.ArrayDim != 0
-                && offs.FProperty.ArrayDim < s.Inherited)
-            {
-                s.Inherited = static_cast<uint32_t>(offs.FProperty.ArrayDim);
-            }
         }
+        // FProperty's fields start at FField's DATA extent (FlagsPrivate+4 = 0x34),
+        // NOT sizeof(FField) (0x38). FField is non-POD (see augment) so the derived
+        // class reuses its tail pad: standard layout packs ArrayDim @ 0x34; alt
+        // layouts (DFM, ArrayDim @ 0x38) get a leading Pad_0x34 then ArrayDim.
+        if (std::string(t.cppName) == "FProperty")
+            s.Inherited = static_cast<uint32_t>(offs.FField.FlagsPrivate + sizeof(int32_t));
         s.Size = sizeOf[t.cppName];
         // Members stays empty — augment() fills via fieldsFor() in next step.
 
@@ -799,7 +798,11 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 rebuilt.push_back(std::move(m));
                 cursor = static_cast<uint32_t>(f.Offset + f.Size);
             }
-            if (cursor < s.Size)
+            // FField gets NO explicit trailing pad: it must end at its data extent
+            // (0x34) so the [0x34,sizeof) tail padding stays implicit and reusable
+            // by FProperty (non-POD base, see ~FField below). An explicit Pad member
+            // would fill dsize to 0x38 and kill the reuse → ArrayDim pushed to 0x38.
+            if (cursor < s.Size && s.CppNameOnly != "FField")
             {
                 UE_UPackage::Member pad;
                 pad.Type   = "uint8_t";
@@ -828,6 +831,12 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 s.Trailer = fmt::format(
                     "static_assert(sizeof({}) == 0x{:X}, \"{} layout mismatch vs dumped size — re-dump SDK\");",
                     s.CppNameOnly, s.Size, s.CppNameOnly);
+
+            // Non-POD base: a user-provided destructor makes FField non-trivial so
+            // the Itanium ABI permits FProperty to reuse FField's tail padding,
+            // packing ArrayDim @ 0x34 (matches real UE, which is polymorphic here).
+            if (s.CppNameOnly == "FField")
+                s.PrefixDecls = "\t~FField() {}";
 
             if (s.CppNameOnly == "UObject")
             {

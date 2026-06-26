@@ -176,20 +176,22 @@ SizeOf(FFieldPathProperty)  = FProperty.Size + FName.Size
 
 其中 `SubPropertyBase = UE_Offsets.FProperty.SubPropertyBase`。
 
-### 4.4 Inherited 一般规则与 FProperty 例外
+### 4.4 Inherited 一般规则与 FProperty 例外（non-POD FField）
 
-合成时 `s.Inherited = SizeOf(parent)`（§3.3 默认规则）。但 **FProperty 的 Inherited 需要 clamp 到探到的 `ArrayDim`**：
+合成时 `s.Inherited = SizeOf(parent)`（§3.3 默认规则）。**FProperty 是例外：`Inherited = FField 的 DATA extent（`FlagsPrivate + 4` = 0x34），而非 `sizeof(FField)`（0x38）`**。配合 non-POD 的 FField，编译器把 FProperty 的首个成员塞进 FField `[0x34,0x38)` 的尾部对齐 pad —— 复刻真·UE 的布局（真 UE 里 FField 是多态类型，本来就 non-POD）。
 
-```
-Inherited(FProperty) = min( SizeOf(FField), UE_Offsets.FProperty.ArrayDim )
-                     = min( align8(FlagsPrivate + 4), ArrayDim )
-```
+要让这条 tail-padding reuse 在 emit 出的 C++ 里真正生效，augment 对 FField 做两件事：
 
-原因：UE 4.25+ 标准 build 下，编译器把 `FProperty.ArrayDim`（int32，4 字节）塞进 FField 末尾 `FlagsPrivate@0x30+4..0x37` 的 4 字节对齐 pad（合法 C++ 派生类 trailing-padding reuse），所以 prober 实测 `ArrayDim @ 0x34`。但 `SizeOf(FField) = align8(0x34) = 0x38`，augment 把 offset < 0x38 的字段全 erase（[Dumper.cpp augment 块][4]），ArrayDim 直接消失。
+1. **emit `~FField() {}`**（`s.PrefixDecls`）——user-provided 析构函数让 FField non-trivial → non-POD，Itanium ABI 才允许派生类复用其 tail padding。
+2. **不 emit FField 的尾部 pad**（augment 尾 pad 循环对 `CppNameOnly == "FField"` 跳过）——FField 必须停在 data extent 0x34，留出 `[0x34,0x38)` 的隐式 tail padding；显式 `Pad_0x34[4]` 成员会把 dsize 撑到 0x38、把可复用的 pad 吃掉。`sizeof(FField)` 仍是 0x38（对齐），static_assert 照常。
 
-DFM-style alt layout 把 ArrayDim 对齐到 0x38，min 是 no-op，行为不变。所以这条 clamp 是单向修正：标准 layout 修好，DFM 不受影响。
+效果：标准 layout（`ArrayDim @ 0x34`）下 FProperty 首成员 ArrayDim 复用 pad 落 0x34；alt layout（DFM，`ArrayDim @ 0x38`）下 augment 在 0x34..0x38 插一个 `Pad_0x34[4]` 占住复用槽、ArrayDim 落 0x38。两种 layout `sizeof(FProperty)` 都等于 dumped size。
 
-> 注：这只调 `Inherited(FProperty)`，**不**改 `SizeOf(FField)` 本身——FField 作为独立结构 emit 时仍然 0x38（C++ 自动按最大成员 8 字节对齐），只是 FProperty 看父类的 "可被复用范围" 比 SizeOf 小 4 字节。
+> **早先的坑**：旧实现把 `Inherited` clamp 到 0x34 却**忘了**让 FField non-POD、也没去掉它的 `Pad_0x34[4]` 成员——POD 基类 **永不** 复用 tail padding，于是编译器把 ArrayDim 顶到 `sizeof(FField)=0x38`，整条 property 链 +4/+8，`static_assert(sizeof(FProperty)==0x78)` 编不过。该 bug 命中所有标准 layout 游戏；DFM 系（`Inherited == 0x38`）凑巧自洽没暴露。
+>
+> **ABI 约束**：tail-padding reuse 是 Itanium ABI 行为，**MSVC ABI 永不复用基类 tail padding**——所以 emit 出来的 SDK 只能用 NDK/Itanium clang 编，host MSVC-target clang 会让 ArrayDim 退回 0x38、static_assert 重新失败。这跟 prober 的 `DrawExportPanel`（同样 non-POD + reuse）一致。
+>
+> FField 仍独立 emit（`UStruct::ChildProperties`、`FField::Next`、`FProperty::Next` 都是 `FField*` 指针需要它）。13 个 FProperty 子类仍 `: FProperty`（FProperty.Size 恒 8 对齐，子类无 tail-padding 问题）。
 
 ## 5. fieldsFor 扩展
 
@@ -216,7 +218,7 @@ else if (cppName == "FField")
     add(offs.FField.NamePrivate,        fnameSize,    "FName",                 "NamePrivate");
     add(offs.FField.FlagsPrivate,       4,            "int32_t",               "FlagsPrivate");
 }
-else if (cppName == "FProperty")
+else if (cppName == "FProperty")  // : FField (non-POD base, 见 §4.4)
 {
     add(offs.FProperty.ArrayDim,        4,            "int32_t",               "ArrayDim");
     add(offs.FProperty.ElementSize,     4,            "int32_t",               "ElementSize");
