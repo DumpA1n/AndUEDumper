@@ -29,6 +29,15 @@ struct UObjectArrayLayout
     int32_t ItemStride = 0x18;
     int32_t ObjectOffset = 0;
     int32_t NumElementsPerChunk = 0x10000;
+    // FUObjectArray / TUObjectArray field offsets, so the emitted struct OVERLAYS the
+    // live (possibly reordered) game memory directly — no host-side synthetic remap.
+    // -1 = use the canonical UE offset (output unchanged for non-reordered games).
+    int32_t ObjObjectsOffset = -1;   // ObjObjects within FUObjectArray      (canon 0x10)
+    int32_t ObjectsOffset = -1;      // Objects within TUObjectArray         (canon 0x0)
+    int32_t MaxElementsOffset = -1;  // MaxElements   (canon: fixed 0x8 / chunked 0x10)
+    int32_t NumElementsOffset = -1;  // NumElements   (canon: fixed 0xC / chunked 0x14)
+    int32_t MaxChunksOffset = -1;    // MaxChunks within TUObjectArray       (canon 0x18)
+    int32_t NumChunksOffset = -1;    // NumChunks within TUObjectArray       (canon 0x1C)
 };
 
 namespace detail
@@ -42,40 +51,74 @@ inline std::string hx(unsigned long v)
 inline int32_t alignUp(int32_t v, int32_t a) { return (v + a - 1) & ~(a - 1); }
 }  // namespace detail
 
-// FName members emitted at their real offsets; gaps padded. Method bodies are
-// layout-independent and kept byte-identical to the old static block.
+// Per-game config macros spliced at the top of Basic.h (@@SDK_GEN_CONFIG@@). Real
+// UE macro names so the macro-guarded core types resolve to this engine build 1:1.
+inline std::string GenSDKConfigDefines(const FNameLayout& L)
+{
+    std::string s;
+    s += "// Engine layout selectors (probed). Drive the macro-guarded core types below.\n";
+    s += std::string("#define WITH_CASE_PRESERVING_NAME ") + (L.CasePreserving ? "1" : "0") + "\n";
+    s += std::string("#define UE_FNAME_OUTLINE_NUMBER   ") + (L.OutlineNumber ? "1" : "0") + "\n";
+    return s;
+}
+
+// FName emitted 1:1 with UE source: #if-guarded fields + getters keyed on the
+// macros above, no padding (real FName is always tightly packed at 0/4/8).
+//
+// UE reorganized FName at 5.1: `Number` moved from after `DisplayIndex` (UE<=5.0)
+// to before it (UE>=5.1) and became gated by UE_FNAME_OUTLINE_NUMBER. The order is
+// only observable in memory when both fields exist (CasePreserving && !OutlineNumber);
+// the probed offsets disambiguate. OutlineNumber is UE5-only so it forces the new
+// order; everything else keeps the UE4 form (unconditional Number) — byte-identical
+// for the non-CP case and matching UE4.25-27 mobile targets verbatim.
 inline std::string GenFName(const FNameLayout& L)
 {
     using detail::hx;
 
-    struct Member { int32_t off; const char* type; const char* name; };
-    std::vector<Member> mem{{L.ComparisonIndex, "int32", "ComparisonIndex"}};
-    if (L.CasePreserving) mem.push_back({L.DisplayIndex, "int32", "DisplayIndex"});
-    if (!L.OutlineNumber) mem.push_back({L.Number, "uint32", "Number"});
-    std::sort(mem.begin(), mem.end(), [](const Member& a, const Member& b) { return a.off < b.off; });
+    auto field = [](const char* type, const char* name) {
+        char line[160];
+        std::snprintf(line, sizeof line, "\t%-44s %s;\n", type, name);
+        return std::string(line);
+    };
+    const std::string cmpField     = field("int32", "ComparisonIndex");
+    const std::string displayField = field("int32", "DisplayIndex");
+    const std::string numberField  = field("uint32", "Number");
+
+    const bool ue5Order =
+        L.OutlineNumber || (L.CasePreserving && !L.OutlineNumber && L.Number < L.DisplayIndex);
 
     std::string s = "class FName final\n{\npublic:\n";
     s += "\tstatic inline std::function<std::string(uint32)> s_NameResolver;\n\n";
 
-    int32_t run = 0;
-    for (const auto& m : mem)
+    s += cmpField;
+    if (ue5Order)
     {
-        if (m.off > run)
-            s += "\tuint8                                         _pad_" + hx(run) + "[" + hx(m.off - run) + "];\n";
-        char line[160];
-        std::snprintf(line, sizeof line, "\t%-44s %s;\n", m.type, m.name);
-        s += line;
-        run = m.off + static_cast<int32_t>(sizeof(int32_t));
+        s += "#if !UE_FNAME_OUTLINE_NUMBER\n" + numberField + "#endif\n";
+        s += "#if WITH_CASE_PRESERVING_NAME\n" + displayField + "#endif\n";
+    }
+    else
+    {
+        s += "#if WITH_CASE_PRESERVING_NAME\n" + displayField + "#endif\n";
+        s += numberField;
     }
 
     s += "\npublic:\n";
-    s += L.CasePreserving ? "\tint32 GetDisplayIndex() const { return DisplayIndex; }\n"
-                          : "\tint32 GetDisplayIndex() const { return ComparisonIndex; }\n";
+    s += "#if WITH_CASE_PRESERVING_NAME\n";
+    s += "\tint32 GetDisplayIndex() const { return DisplayIndex; }\n";
+    s += "#else\n";
+    s += "\tint32 GetDisplayIndex() const { return ComparisonIndex; }\n";
+    s += "#endif\n";
+    s += "\tint32 GetComparisonIndex() const { return ComparisonIndex; }\n";
+    s += "#if UE_FNAME_OUTLINE_NUMBER\n";
+    s += "\tint32 GetNumber() const { return 0; }\n";
+    s += "#else\n";
+    s += "\tint32 GetNumber() const { return Number; }\n";
+    s += "#endif\n";
     s += R"BODY(
 	static std::string GetPlainANSIString(const FName* Name)
 	{
 		if (s_NameResolver)
-			return s_NameResolver(Name->ComparisonIndex);
+			return s_NameResolver(Name->GetDisplayIndex());
 		return {};
 	}
 
@@ -94,19 +137,29 @@ inline std::string GenFName(const FNameLayout& L)
 	}
 
 )BODY";
-    s += L.OutlineNumber
-             ? "\tbool operator==(const FName& Other) const { return ComparisonIndex == Other.ComparisonIndex; }\n"
-             : "\tbool operator==(const FName& Other) const { return ComparisonIndex == Other.ComparisonIndex && Number == Other.Number; }\n";
+    s += "\tbool operator==(const FName& Other) const\n";
+    s += "\t{\n";
+    s += "\t\treturn ComparisonIndex == Other.ComparisonIndex\n";
+    s += "#if !UE_FNAME_OUTLINE_NUMBER\n";
+    s += "\t\t\t&& Number == Other.Number\n";
+    s += "#endif\n";
+    s += "\t\t;\n";
+    s += "\t}\n";
     s += "\tbool operator!=(const FName& Other) const { return !(*this == Other); }\n";
     s += "};\n";
 
     s += "static_assert(alignof(FName) == 0x4, \"Wrong alignment on FName\");\n";
     s += "static_assert(sizeof(FName) == " + hx(L.Size) + ", \"Wrong size on FName\");\n";
     s += "static_assert(offsetof(FName, ComparisonIndex) == " + hx(L.ComparisonIndex) + ", \"Member 'FName::ComparisonIndex' has a wrong offset!\");\n";
-    if (L.CasePreserving)
-        s += "static_assert(offsetof(FName, DisplayIndex) == " + hx(L.DisplayIndex) + ", \"Member 'FName::DisplayIndex' has a wrong offset!\");\n";
-    if (!L.OutlineNumber)
-        s += "static_assert(offsetof(FName, Number) == " + hx(L.Number) + ", \"Member 'FName::Number' has a wrong offset!\");\n";
+    s += "#if WITH_CASE_PRESERVING_NAME\n";
+    s += "static_assert(offsetof(FName, DisplayIndex) == " + hx(L.DisplayIndex) + ", \"Member 'FName::DisplayIndex' has a wrong offset!\");\n";
+    s += "#endif\n";
+    // UE4 form keeps Number unconditional; UE5 form gates it on the outline macro.
+    if (ue5Order)
+        s += "#if !UE_FNAME_OUTLINE_NUMBER\n";
+    s += "static_assert(offsetof(FName, Number) == " + hx(L.Number) + ", \"Member 'FName::Number' has a wrong offset!\");\n";
+    if (ue5Order)
+        s += "#endif\n";
     return s;
 }
 
@@ -199,6 +252,43 @@ inline std::string GenUObjectArray(const UObjectArrayLayout& L)
     const std::string nepcStr = (nepc == 64 * 1024) ? "64 * 1024" : std::to_string(nepc);
     const std::string arrType = chunked ? "FChunkedFixedUObjectArray" : "FFixedUObjectArray";
 
+    // Emit data members at explicit offsets, padding gaps so the struct overlays the
+    // live (possibly reordered) game array 1:1. Specs may be out of order.
+    struct GF { const char* type; const char* name; int32_t off; int32_t size; };
+    auto emitFields = [](std::vector<GF> fs) {
+        std::sort(fs.begin(), fs.end(), [](const GF& a, const GF& b) { return a.off < b.off; });
+        std::string r;
+        int32_t cursor = 0, padIdx = 0;
+        for (const auto& f : fs)
+        {
+            if (f.off > cursor)
+            {
+                r += "\tuint8 _pad_" + std::to_string(padIdx++) + "[" + detail::hx(f.off - cursor) + "];\n";
+                cursor = f.off;
+            }
+            r += std::string("\t") + f.type + " " + f.name + ";\n";
+            cursor = f.off + f.size;
+        }
+        return r;
+    };
+    auto eff = [](int32_t v, int32_t canon) { return v >= 0 ? v : canon; };
+
+    // Active array (TUObjectArray alias) takes probed offsets; sibling stays canonical.
+    const int32_t objObjectsOff = eff(L.ObjObjectsOffset, 0x10);
+    const int32_t aObjects   = eff(L.ObjectsOffset, 0x0);
+    const int32_t aMaxElem   = chunked ? eff(L.MaxElementsOffset, 0x10) : eff(L.MaxElementsOffset, 0x8);
+    const int32_t aNumElem   = chunked ? eff(L.NumElementsOffset, 0x14) : eff(L.NumElementsOffset, 0xC);
+    const int32_t aMaxChunks = eff(L.MaxChunksOffset, 0x18);
+    const int32_t aNumChunks = eff(L.NumChunksOffset, 0x1C);
+
+    const std::string fixedFields = chunked
+        ? emitFields({{"FUObjectItem*", "Objects", 0x0, 8}, {"int32", "MaxElements", 0x8, 4}, {"int32", "NumElements", 0xC, 4}})
+        : emitFields({{"FUObjectItem*", "Objects", aObjects, 8}, {"int32", "MaxElements", aMaxElem, 4}, {"int32", "NumElements", aNumElem, 4}});
+
+    const std::string chunkedFields = chunked
+        ? emitFields({{"FUObjectItem**", "Objects", aObjects, 8}, {"int32", "MaxElements", aMaxElem, 4}, {"int32", "NumElements", aNumElem, 4}, {"int32", "MaxChunks", aMaxChunks, 4}, {"int32", "NumChunks", aNumChunks, 4}})
+        : emitFields({{"FUObjectItem**", "Objects", 0x0, 8}, {"int32", "MaxElements", 0x10, 4}, {"int32", "NumElements", 0x14, 4}, {"int32", "MaxChunks", 0x18, 4}, {"int32", "NumChunks", 0x1C, 4}});
+
     std::string s;
 
     // check/checkf/etc. come from "UEAssert.h" (included by Basic.h ahead of this block).
@@ -206,13 +296,9 @@ inline std::string GenUObjectArray(const UObjectArrayLayout& L)
     s += "static_assert(sizeof(FUObjectItem) == " + hx(stride) + ", \"FUObjectItem stride mismatch vs dumped size — re-dump SDK\");\n";
     s += "static_assert(offsetof(FUObjectItem, Object) == " + hx(objOff) + ", \"FUObjectItem::Object has a wrong offset!\");\n\n";
 
-    s += R"OARR(class FFixedUObjectArray
-{
-public:
-	FUObjectItem* Objects;
-	int32 MaxElements;
-	int32 NumElements;
-
+    s += "class FFixedUObjectArray\n{\npublic:\n";
+    s += fixedFields;
+    s += R"OARR(
 	inline int32 Num() const
 	{
 		return NumElements;
@@ -265,13 +351,9 @@ public:
     s += R"OARR(,
 	};
 
-	FUObjectItem** Objects;
-	FUObjectItem* PreAllocatedObjects;
-	int32 MaxElements;
-	int32 NumElements;
-	int32 MaxChunks;
-	int32 NumChunks;
-
+)OARR";
+    s += chunkedFields;
+    s += R"OARR(
 	inline int32 Num() const
 	{
 		return NumElements;
@@ -333,27 +415,24 @@ public:
     s += arrType;
     s += R"OARR( TUObjectArray;
 
-private:
-	TUObjectArray* ObjObjects = nullptr;
+)OARR";
+    if (objObjectsOff > 0)
+        s += "\tuint8 ObjObjectsPadding[" + hx(objObjectsOff) + "];\n";
+    s += R"OARR(	TUObjectArray ObjObjects;
 
 public:
-	inline void InitManually(void* GObjectsAddressParameter)
-	{
-		ObjObjects = reinterpret_cast<TUObjectArray*>(GObjectsAddressParameter);
-	}
-
 	inline int32 GetObjectArrayNum() const
 	{
-		return ObjObjects ? ObjObjects->Num() : 0;
+		return ObjObjects.Num();
 	}
 
 	int32 ObjectToIndex(const class UObject* Object) const;
 
 	inline FUObjectItem* IndexToObject(int32 Index)
 	{
-		if (!ObjObjects || !ObjObjects->IsValidIndex(Index))
+		if (!ObjObjects.IsValidIndex(Index))
 			return nullptr;
-		return ObjObjects->GetObjectPtr(Index);
+		return ObjObjects.GetObjectPtr(Index);
 	}
 
 	// Convenience iterator (not UE source). Callback returns true to stop early.
@@ -371,8 +450,18 @@ public:
 	}
 };
 
-extern FUObjectArray GUObjectArray;
 )OARR";
+    // Overlay guards: the emitted struct must map 1:1 onto live memory.
+    s += "static_assert(offsetof(FUObjectArray, ObjObjects) == " + hx(objObjectsOff) + ", \"ObjObjects overlay offset mismatch — re-dump SDK\");\n";
+    s += "static_assert(offsetof(" + arrType + ", Objects) == " + hx(aObjects) + ", \"TUObjectArray::Objects overlay offset mismatch — re-dump SDK\");\n";
+    s += "static_assert(offsetof(" + arrType + ", NumElements) == " + hx(aNumElem) + ", \"TUObjectArray::NumElements overlay offset mismatch — re-dump SDK\");\n";
+    s += "static_assert(offsetof(" + arrType + ", MaxElements) == " + hx(aMaxElem) + ", \"TUObjectArray::MaxElements overlay offset mismatch — re-dump SDK\");\n";
+    if (chunked)
+    {
+        s += "static_assert(offsetof(" + arrType + ", NumChunks) == " + hx(aNumChunks) + ", \"TUObjectArray::NumChunks overlay offset mismatch — re-dump SDK\");\n";
+        s += "static_assert(offsetof(" + arrType + ", MaxChunks) == " + hx(aMaxChunks) + ", \"TUObjectArray::MaxChunks overlay offset mismatch — re-dump SDK\");\n";
+    }
+    s += "\nextern FUObjectArray* GUObjectArray;\n";
 
     return s;
 }
@@ -382,6 +471,7 @@ inline std::string SpliceLayoutCoreTypes(std::string content, const FNameLayout&
 {
     struct Sub { const char* tok; std::string code; };
     const Sub subs[] = {
+        {"// @@SDK_GEN_CONFIG@@", GenSDKConfigDefines(L)},
         {"// @@SDK_GEN_UOBJECTARRAY@@", GenUObjectArray(UA)},
         {"// @@SDK_GEN_FNAME@@", GenFName(L)},
         {"// @@SDK_GEN_FSCRIPTDELEGATE@@", GenFScriptDelegate(L)},

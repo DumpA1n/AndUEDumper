@@ -1191,10 +1191,10 @@ static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
 
 class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
 {
-    const int32_t N = GUObjectArray.GetObjectArrayNum();
+    const int32_t N = GUObjectArray->GetObjectArrayNum();
     for (int32_t i = 0; i < N; ++i)
     {
-        FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+        FUObjectItem* Item = GUObjectArray->IndexToObject(i);
         UObject* Object = Item ? Item->Object : nullptr;
         if (!Object || (reinterpret_cast<uintptr_t>(Object) & 0x7) != 0)
             continue;
@@ -1206,10 +1206,10 @@ class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFl
 
 class UObject* UObject::FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType)
 {
-    const int32_t N = GUObjectArray.GetObjectArrayNum();
+    const int32_t N = GUObjectArray->GetObjectArrayNum();
     for (int32_t i = 0; i < N; ++i)
     {
-        FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+        FUObjectItem* Item = GUObjectArray->IndexToObject(i);
         UObject* Object = Item ? Item->Object : nullptr;
         if (!Object) continue;
         if (Object->HasTypeFlag(RequiredType) && Object->GetName() == Name)
@@ -1518,7 +1518,7 @@ static void EmitSDKCoreFiles(
     {
         auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
         buf.append("// Bodies for UObject helpers + UFunction dispatch.\n");
-        buf.append("// Wire FName::s_NameResolver and GUObjectArray.InitManually() at startup.\n\n");
+        buf.append("// Wire FName::s_NameResolver and point GUObjectArray at the live &FUObjectArray at startup.\n\n");
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
@@ -1622,9 +1622,21 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                        static_cast<int32_t>(o.FName.Number),
                        o.Config.isUsingCasePreservingName,
                        o.Config.isUsingOutlineNumberName};
-        uobjArrayLayout = {o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18,
-                           static_cast<int32_t>(o.FUObjectItem.Object),
-                           static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk)};
+        uobjArrayLayout.ItemStride = o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18;
+        uobjArrayLayout.ObjectOffset = static_cast<int32_t>(o.FUObjectItem.Object);
+        uobjArrayLayout.NumElementsPerChunk = static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk);
+        // A reordering profile (e.g. DeltaForce) sets the full count-field offset set;
+        // canonical games leave MaxElements/MaxChunks/NumChunks at 0. Only when reordered
+        // do we pass offsets raw (0 is then a REAL offset, e.g. DFM MaxChunks@0x0) — else
+        // hand the generator -1 so it emits the canonical UE layout byte-identical to before.
+        const bool reordered = o.TUObjectArray.MaxElements || o.TUObjectArray.MaxChunks || o.TUObjectArray.NumChunks;
+        auto pick = [&](uintptr_t v) -> int32_t { return reordered ? static_cast<int32_t>(v) : -1; };
+        uobjArrayLayout.ObjObjectsOffset  = pick(o.FUObjectArray.ObjObjects);
+        uobjArrayLayout.ObjectsOffset     = pick(o.TUObjectArray.Objects);
+        uobjArrayLayout.MaxElementsOffset = pick(o.TUObjectArray.MaxElements);
+        uobjArrayLayout.NumElementsOffset = pick(o.TUObjectArray.NumElements);
+        uobjArrayLayout.MaxChunksOffset   = pick(o.TUObjectArray.MaxChunks);
+        uobjArrayLayout.NumChunksOffset   = pick(o.TUObjectArray.NumChunks);
     }
     EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, _sdkEnumUnderlying, outBuffersMap);
 

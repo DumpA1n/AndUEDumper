@@ -51,7 +51,10 @@ struct UE_Offsets
     struct
     {
         uintptr_t Objects = 0;
+        uintptr_t MaxElements = 0;
         uintptr_t NumElements = 0;
+        uintptr_t MaxChunks = 0;
+        uintptr_t NumChunks = 0;
         uintptr_t NumElementsPerChunk = 0;
     } TUObjectArray;
     struct

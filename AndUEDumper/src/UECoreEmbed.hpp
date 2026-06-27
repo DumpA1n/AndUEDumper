@@ -124,6 +124,10 @@ static const char* kUECoreBasicH = R"UECoreBasicH(
 #include "UEAssert.h"
 #include "UnrealContainers.h"
 
+// Per-game engine layout selectors (#define WITH_CASE_PRESERVING_NAME / UE_FNAME_OUTLINE_NUMBER),
+// generated from the probed UE_Offsets; drives the macro-guarded core types below.
+// @@SDK_GEN_CONFIG@@
+
 namespace SDK {
 
 using namespace UC;
@@ -1012,7 +1016,7 @@ static const char* kUECoreBasicCpp = R"UECoreBasicCpp(
 namespace SDK
 {
 
-FUObjectArray GUObjectArray;
+FUObjectArray* GUObjectArray = nullptr;
 
 int32 FUObjectArray::ObjectToIndex(const class UObject* Object) const
 {
@@ -1046,15 +1050,15 @@ uint64 BasicFilesImpleUtils::GetObjFNameAsUInt64(class UClass* Class)
 
 class UObject* BasicFilesImpleUtils::GetObjectByIndex(int32 Index)
 {
-	FUObjectItem* Item = GUObjectArray.IndexToObject(Index);
+	FUObjectItem* Item = GUObjectArray->IndexToObject(Index);
 	return Item ? Item->Object : nullptr;
 }
 
 UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 {
-	for (int i = 0; i < GUObjectArray.GetObjectArrayNum(); ++i)
+	for (int i = 0; i < GUObjectArray->GetObjectArrayNum(); ++i)
 	{
-		FUObjectItem* Item = GUObjectArray.IndexToObject(i);
+		FUObjectItem* Item = GUObjectArray->IndexToObject(i);
 		UObject* Object = Item ? Item->Object : nullptr;
 
 		if (!Object)
@@ -1072,7 +1076,7 @@ UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 
 class UObject* FWeakObjectPtr::Get() const
 {
-	FUObjectItem* Item = GUObjectArray.IndexToObject(ObjectIndex);
+	FUObjectItem* Item = GUObjectArray->IndexToObject(ObjectIndex);
 	return Item ? Item->Object : nullptr;
 }
 
@@ -1081,7 +1085,7 @@ class UObject* FWeakObjectPtr::Get() const
 
 class UObject* FWeakObjectPtr::operator->() const
 {
-	FUObjectItem* Item = GUObjectArray.IndexToObject(ObjectIndex);
+	FUObjectItem* Item = GUObjectArray->IndexToObject(ObjectIndex);
 	return Item ? Item->Object : nullptr;
 }
 
