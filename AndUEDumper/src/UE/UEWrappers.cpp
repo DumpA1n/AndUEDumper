@@ -1182,6 +1182,7 @@ UEPropTypeInfo UE_FProperty::GetType() const
     }
     case HASH("ObjectProperty"):
     case HASH("ObjectPtrProperty"):
+    case HASH("EncryptedObjectProperty"):
     {
         auto obj = this->Cast<UE_FObjectPropertyBase>();
         type = {UEPropertyType::ObjectProperty, obj.GetTypeStr()};

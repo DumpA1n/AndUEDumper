@@ -200,8 +200,7 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uintptr_t namesPtr = _profile->GetUEVars()->GetNamesPtr();
     uintptr_t objectsArrayPtr = _profile->GetUEVars()->GetGUObjectsArrayPtr();
     uintptr_t objObjectsPtr = _profile->GetUEVars()->GetObjObjectsPtr();
-    uintptr_t UEnginePtr = 0, UWorldPtr = 0, ProcessEventPtr = 0;
-    int ProcessEventIndex = 0;
+    uintptr_t UEnginePtr = 0, UWorldPtr = 0;
 
     // Find UEngine & UWorld
     uint8_t *UEngineObj = nullptr, *UWorldObj = nullptr;
@@ -230,20 +229,35 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
         }
 
         auto ueSegs = _profile->GetUnrealELF().segments();
+        constexpr size_t kReferenceScanChunkBytes = 1024 * 1024;
 
-        // reverse search, start with .bss
+        // Segment reads remain fixed-size so malformed ELF ranges cannot drive allocation size.
         for (auto it = ueSegs.begin(); it != ueSegs.end(); ++it)
         {
             if (!it->is_rw || it->startAddress == baseAddr)
                 continue;
 
-            std::vector<char> buffer(it->length, 0);
-            vm_rpm_ptr((void *)it->startAddress, buffer.data(), buffer.size());
+            size_t consumed = 0;
+            while (consumed < it->length
+                && ((!UEnginePtr && UEngineObj) || (!UWorldPtr && UWorldObj)))
+            {
+                const size_t chunkBytes = std::min(kReferenceScanChunkBytes, it->length - consumed);
+                if (chunkBytes < sizeof(void *))
+                    break;
+                if (it->startAddress > UINTPTR_MAX - consumed)
+                    break;
+                const uintptr_t chunkAddress = it->startAddress + consumed;
+                std::vector<char> buffer(chunkBytes, 0);
+                if (!vm_rpm_ptr((void *)chunkAddress, buffer.data(), buffer.size()))
+                    break;
+                if (!UEnginePtr && UEngineObj)
+                    UEnginePtr = FindAlignedPointerRefrence(chunkAddress, buffer, (uintptr_t)UEngineObj);
+                if (!UWorldPtr && UWorldObj)
+                    UWorldPtr = FindAlignedPointerRefrence(chunkAddress, buffer, (uintptr_t)UWorldObj);
+                consumed += chunkBytes;
+            }
 
-            UEnginePtr = FindAlignedPointerRefrence(it->startAddress, buffer, (uintptr_t)UEngineObj);
-            UWorldPtr = FindAlignedPointerRefrence(it->startAddress, buffer, (uintptr_t)UWorldObj);
-
-            if (UEnginePtr != 0 || UWorldPtr != 0)
+            if ((!UEngineObj || UEnginePtr) && (!UWorldObj || UWorldPtr))
                 break;
         }
 
@@ -257,13 +271,13 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
         else
             logsBufferFmt.append("GWorld: [<Base> + 0x{:X}] = 0x{:X}\n", UWorldPtr - baseAddr, UWorldPtr);
 
-        logsBufferFmt.append("Finding ProcessEvent...\n");
-        uint8_t *obj = UEngineObj ? UEngineObj : UWorldObj;
-        if (!obj || !_profile->findProcessEvent(obj, &ProcessEventPtr, &ProcessEventIndex))
-            logsBufferFmt.append("Couldn't find ProcessEvent.\n");
-        else
-            logsBufferFmt.append("ProcessEvent: Index({}) | [<Base> + 0x{:X}] = 0x{:X}\n", ProcessEventIndex, ProcessEventPtr - baseAddr, ProcessEventPtr);
     }
+
+    if (_hasVerifiedProcessEvent)
+        logsBufferFmt.append("ProcessEvent: Index({}) | [<Base> + 0x{:X}] = 0x{:X}\n",
+            _processEventIndex, _processEventAddress - baseAddr, _processEventAddress);
+    else
+        logsBufferFmt.append("ProcessEvent metadata was not supplied by a verified discovery stage.\n");
 
     UE_Pointers uEPointers{};
     uEPointers.Names = namesPtr - baseAddr;
@@ -271,10 +285,8 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uEPointers.ObjObjects = objObjectsPtr - baseAddr;
     uEPointers.Engine = UEnginePtr ? (UEnginePtr - baseAddr) : 0;
     uEPointers.World = UWorldPtr ? (UWorldPtr - baseAddr) : 0;
-    uEPointers.ProcessEvent = ProcessEventPtr ? (ProcessEventPtr - baseAddr) : 0;
-    uEPointers.ProcessEventIndex = ProcessEventIndex;
-
-    _processEventIndex = ProcessEventIndex;
+    uEPointers.ProcessEvent = _hasVerifiedProcessEvent ? (_processEventAddress - baseAddr) : 0;
+    uEPointers.ProcessEventIndex = _hasVerifiedProcessEvent ? _processEventIndex : 0;
 
     offsetsBufferFmt.append("#pragma once\n\n#include <cstdint>\n\n\n");
     offsetsBufferFmt.append("{}\n\n{}", _profile->GetOffsets()->ToString(), uEPointers.ToString());
@@ -405,9 +417,8 @@ void UEDumper::SynthesizeReflectionTypes()
     sizeOf["FObjectPropertyBase"] = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
     sizeOf["FClassProperty"]      = sizeOf["FObjectPropertyBase"] + sizeof(void *);
     sizeOf["FSoftClassProperty"]  = sizeOf["FClassProperty"];
-    // Per-subclass override wins over global SubPropertyBase. Picks per-subclass
-    // when prober wrote it back (DFM-style alt layouts where individual derived
-    // classes have their own pad), else falls through to SubPropertyBase.
+    // Explicit subclass offsets describe layouts whose tails do not share the
+    // common FProperty base; zero retains the common-base representation.
     auto innerOff = [&](uintptr_t perSub, uintptr_t fallback) -> uintptr_t {
         return perSub ? perSub : fallback;
     };
@@ -595,10 +606,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
         const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
         const uint32_t fnameSize = static_cast<uint32_t>(offs.FName.Size ? offs.FName.Size : 8);
 
-        // Per-subclass tail-offset resolution: prober-written value wins, else
-        // fall back to FProperty.SubPropertyBase. Mirrors the runtime fallback
-        // chain in UEWrappers.cpp so the synthesized struct layout matches the
-        // walker's actual read offsets.
+        // Subclass-specific offsets and the common-base representation are both
+        // reflected in the generated declared layout.
         auto innerOff = [&](uintptr_t perSub, uintptr_t fallback) -> uintptr_t {
             return perSub ? perSub : fallback;
         };
@@ -1771,4 +1780,3 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                          prefix, nonCorePkgCount);
     logsBufferFmt.append("==========================\n");
 }
-

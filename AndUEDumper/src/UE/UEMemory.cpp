@@ -31,7 +31,7 @@ namespace UEMemory
         chars.clear();
         chars.shrink_to_fit();
 
-        if ((int)str[0] == 0 && str.size() == 1)
+        if (str.size() == 1 && (int)str[0] == 0)
             return "";
 
         return str;
@@ -55,7 +55,7 @@ namespace UEMemory
         chars.clear();
         chars.shrink_to_fit();
 
-        if ((int)str[0] == 0 && str.size() == 1)
+        if (str.size() == 1 && (int)str[0] == 0)
             return L"";
 
         return str;

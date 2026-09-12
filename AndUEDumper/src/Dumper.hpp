@@ -37,8 +37,10 @@ private:
     ProgressCallback _objectsProgressCallback;
     ProgressCallback _dumpProgressCallback;
 
-    // per-game ProcessEvent vtable slot, baked into emitted SDK
+    // Separately validated ProcessEvent metadata, baked into emitted SDK.
     int _processEventIndex = 0;
+    uintptr_t _processEventAddress = 0;
+    bool _hasVerifiedProcessEvent = false;
 
     SDKMode _sdkMode = SDKMode::Both;
 
@@ -55,6 +57,13 @@ public:
 
     void SetSDKMode(SDKMode m) { _sdkMode = m; }
     SDKMode GetSDKMode() const { return _sdkMode; }
+
+    void SetVerifiedProcessEvent(uintptr_t address, int index)
+    {
+        _processEventAddress = address;
+        _processEventIndex = index;
+        _hasVerifiedProcessEvent = address != 0 && index >= 0;
+    }
 
     bool Init(IGameProfile *profile);
 
