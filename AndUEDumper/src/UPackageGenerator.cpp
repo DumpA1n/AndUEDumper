@@ -1,8 +1,9 @@
 #include "UPackageGenerator.hpp"
 
-#include <cctype>
+#include <optional>
 #include <unordered_set>
 
+#include "SDKIdentifiers.hpp"
 #include "UE/UEMemory.hpp"
 using namespace UEMemory;
 
@@ -44,65 +45,34 @@ void UE_UPackage::FillPadding(const UE_UStruct &object, std::vector<Member> &mem
     }
 }
 
-// SanitizeForCpp: replace non-identifier chars with '_'; preserve template/decl punctuation.
 static std::string SanitizeForCpp(const std::string &in)
 {
-    std::string out;
-    out.reserve(in.size());
-    for (char c : in)
-    {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        const bool keep = std::isalnum(uc) || c == '_'
-                       || c == ' ' || c == '\t'
-                       || c == '<' || c == '>' || c == ','
-                       || c == '*' || c == '&'
-                       || c == ':'
-                       || c == '[' || c == ']';
-        out += keep ? c : '_';
-    }
-    return out;
+    return SDKIdentifiers::SanitizeType(in);
 }
 
-// SanitizeIdentifier: strict [A-Za-z0-9_]+ for pure-ident positions
 static std::string SanitizeIdentifier(const std::string &in)
 {
-    std::string out;
-    out.reserve(in.size());
-    for (char c : in)
-    {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        out += (std::isalnum(uc) || c == '_') ? c : '_';
-    }
-    return out;
+    return SDKIdentifiers::Sanitize(in);
 }
 
-// SanitizeIdentForCpp: SanitizeIdentifier + suffix '_' if C++ keyword or reserved local
 static std::string SanitizeIdentForCpp(const std::string &in)
 {
-    std::string out = SanitizeIdentifier(in);
-    if (out.empty())
-        return out;
+    return SDKIdentifiers::Sanitize(in);
+}
 
-    static const std::unordered_set<std::string> kReserved = {
-        // C++ keywords (covers C++20)
-        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor","bool",
-        "break","case","catch","char","char8_t","char16_t","char32_t","class",
-        "compl","concept","const","consteval","constexpr","constinit","const_cast",
-        "continue","co_await","co_return","co_yield","decltype","default","delete",
-        "do","double","dynamic_cast","else","enum","explicit","export","extern",
-        "false","float","for","friend","goto","if","inline","int","long","mutable",
-        "namespace","new","noexcept","not","not_eq","nullptr","operator","or","or_eq",
-        "private","protected","public","register","reinterpret_cast","requires",
-        "return","short","signed","sizeof","static","static_assert","static_cast",
-        "struct","switch","template","this","thread_local","throw","true","try",
-        "typedef","typeid","typename","union","unsigned","using","virtual","void",
-        "volatile","wchar_t","while","xor","xor_eq",
-        // generated locals — UE BP-named params can shadow these
-        "Parms","Func",
-    };
-    if (kReserved.count(out))
-        out.push_back('_');
-    return out;
+static std::optional<std::string> ReflectedTypeForCpp(const UEPropTypeInfo &type,
+                                                       int32_t size,
+                                                       bool allowOpaquePointer)
+{
+    std::string result = SanitizeForCpp(type.second);
+    const bool sentinel = result == "None" || result == "ENone";
+    if (type.first != UEPropertyType::Unknown && !sentinel
+        && SDKIdentifiers::IsUsableType(result))
+        return result;
+    if (allowOpaquePointer && size == static_cast<int32_t>(sizeof(void *))
+        && result.find('*') != std::string::npos)
+        return std::string{"void*"};
+    return std::nullopt;
 }
 
 // builtins/preamble idents — never count as package deps
@@ -244,7 +214,7 @@ void UE_UPackage::ExtractTypeDeps(const std::string &typeStr,
     }
 }
 
-void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
+bool UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
 {
     out->Name = fn.GetName();
     out->FullName = fn.GetFullName();
@@ -256,7 +226,9 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
     out->IsStatic = (out->EFlags & FUNC_Static) != 0;
     out->ReturnType = "void"; // overwritten if a CPF_ReturnParm is found
 
-    const std::string sanitizedFuncName = SanitizeIdentForCpp(fn.GetName());
+    out->CppNameOnly = SanitizeIdentForCpp(fn.GetName());
+    std::unordered_set<std::string> parameterNames;
+    bool usable = true;
 
     auto generateParam = [&](IProperty *prop)
     {
@@ -265,13 +237,26 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         // if property has 'ReturnParm' flag
         if (flags & CPF_ReturnParm)
         {
-            out->ReturnType = SanitizeForCpp(prop->GetType().second);
+            auto type = ReflectedTypeForCpp(prop->GetType(), prop->GetSize(), true);
+            if (!type)
+            {
+                usable = false;
+                return;
+            }
+            out->ReturnType = std::move(*type);
         }
         // if property has 'Parm' flag
         else if (flags & CPF_Parm)
         {
-            const std::string typeStr = SanitizeForCpp(prop->GetType().second);
-            const std::string nameStr = SanitizeIdentForCpp(prop->GetName());
+            auto type = ReflectedTypeForCpp(prop->GetType(), prop->GetSize(), true);
+            if (!type)
+            {
+                usable = false;
+                return;
+            }
+            const std::string typeStr = std::move(*type);
+            const std::string nameStr = SDKIdentifiers::MakeUnique(
+                SanitizeIdentForCpp(prop->GetName()), parameterNames);
             const int32_t arrDim = prop->GetArrayDim();
 
             Param p;
@@ -313,6 +298,8 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         auto propInterface = prop.GetInterface();
         generateParam(&propInterface);
     }
+    if (!usable)
+        return false;
     if (out->Params.size())
     {
         out->Params.erase(out->Params.size() - 2);
@@ -324,7 +311,8 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         out->CppName += "static ";
     out->CppName += out->ReturnType;
     out->CppName += ' ';
-    out->CppName += sanitizedFuncName;
+    out->CppName += out->CppNameOnly;
+    return true;
 }
 
 void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &arr)
@@ -359,37 +347,32 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
 
     uint32_t offset = s.Inherited;
     uint8_t bitOffset = 0;
+    std::unordered_set<std::string> scopeIdentifiers;
 
-    auto generateMember = [&](IProperty *prop, Member *m)
+    auto generateMember = [&](IProperty *prop, Member *m) -> bool
     {
         auto arrDim = prop->GetArrayDim();
         m->Size = prop->GetSize() * arrDim;
         if (m->Size == 0)
         {
-            return;
+            return false;
         }  // this shouldn't be zero
 
         auto type = prop->GetType();
-        m->Type = SanitizeForCpp(type.second);
-        m->Name = SanitizeIdentForCpp(prop->GetName());
+        auto reflectedType = ReflectedTypeForCpp(type, prop->GetSize(), false);
+        m->Name = SDKIdentifiers::MakeUnique(
+            SanitizeIdentForCpp(prop->GetName()), scopeIdentifiers);
         m->Offset = prop->GetOffset();
 
-        // unknown types ('None'/'ENone'): replace with opaque uint8_t buffer
-        if (type.first == UEPropertyType::Unknown
-            || m->Type.empty()
-            || m->Type == "None"
-            || m->Type == "ENone")
+        const bool opaque = !reflectedType;
+        if (opaque)
         {
-            if (m->Size <= 1)
-            {
-                m->Type = "uint8_t";
-            }
-            else
-            {
-                m->Type = "uint8_t";
+            m->Type = "uint8_t";
+            if (m->Size > 1)
                 m->Name += fmt::format("[0x{:X}]", m->Size);
-            }
         }
+        else
+            m->Type = std::move(*reflectedType);
 
         // Track which other dumped types this member references
         ExtractTypeDeps(m->Type, s.FullDeps, s.ForwardDeps);
@@ -440,21 +423,22 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         }
         else
         {
-            if (arrDim > 1)
+            if (!opaque && arrDim > 1)
             {
                 m->Name += fmt::format("[0x{:X}]", arrDim);
             }
 
             offset += m->Size;
         }
+        return true;
     };
 
     for (auto prop = object.GetChildProperties().Cast<UE_FProperty>(); prop; prop = prop.GetNext().Cast<UE_FProperty>())
     {
         Member m;
         auto propInterface = prop.GetInterface();
-        generateMember(&propInterface, &m);
-        s.Members.push_back(m);
+        if (generateMember(&propInterface, &m))
+            s.Members.push_back(std::move(m));
     }
 
     for (auto child = object.GetChildren(); child; child = child.GetNext())
@@ -463,7 +447,15 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         {
             auto fn = child.Cast<UE_UFunction>();
             Function f;
-            GenerateFunction(fn, &f);
+            if (!GenerateFunction(fn, &f))
+                continue;
+            f.CppNameOnly = SDKIdentifiers::MakeUnique(f.CppNameOnly, scopeIdentifiers);
+            f.CppName.clear();
+            if (f.IsStatic)
+                f.CppName += "static ";
+            f.CppName += f.ReturnType;
+            f.CppName += ' ';
+            f.CppName += f.CppNameOnly;
             f.OwnerCppName = s.CppNameOnly;
             f.OwnerUEName = s.Name;
             // fn signatures only need fwd-decls (bodies live in .cpp)
@@ -476,8 +468,8 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             auto prop = child.Cast<UE_UProperty>();
             Member m;
             auto propInterface = prop.GetInterface();
-            generateMember(&propInterface, &m);
-            s.Members.push_back(m);
+            if (generateMember(&propInterface, &m))
+                s.Members.push_back(std::move(m));
         }
     }
 

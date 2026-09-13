@@ -33,6 +33,7 @@ public:
         std::string Name;
         std::string FullName;
         std::string CppName;        // "[static ]<ReturnType> <FuncName>"
+        std::string CppNameOnly;    // sanitized and unique within the owner
         std::string Params;         // "(Type Name, Type& OutName, ...)"  payload only
         std::string ReturnType;     // "void" / "FVector" / ...
         std::string OwnerCppName;   // owner struct C++ name (qualifier in out-of-line bodies)
@@ -86,7 +87,7 @@ public:
     std::vector<Enum> Enums;
 
 private:
-    static void GenerateFunction(const UE_UFunction &fn, Function *out);
+    static bool GenerateFunction(const UE_UFunction &fn, Function *out);
     static void GenerateStruct(const UE_UStruct &object, std::vector<Struct> &arr);
     static void GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr);
 
