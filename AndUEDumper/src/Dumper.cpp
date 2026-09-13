@@ -14,6 +14,7 @@ using json = nlohmann::json;
 using namespace UEMemory;
 
 #include "UPackageGenerator.hpp"
+#include "SDKMathNames.hpp"
 #include "UECoreEmbed.hpp"
 #include "UtfcppEmbed.hpp"
 #include "SDKCoreGen.hpp"
@@ -1030,6 +1031,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
                 if (mathOps)
                 {
+                    if (!SDKMathNames::Canonicalize(s.CppNameOnly, s.Members))
+                        continue;
                     if (!s.ExtraDecls.empty())
                         s.ExtraDecls += "\n";
                     s.ExtraDecls += mathOps;
