@@ -5,6 +5,15 @@
 
 using namespace UEMemory;
 
+namespace
+{
+bool canReadWithProvider(uintptr_t address)
+{
+    uint8_t value = 0;
+    return address && vm_rpm_ptr(reinterpret_cast<void *>(address), &value, sizeof(value));
+}
+}
+
 UEVarsInitStatus IGameProfile::InitUEVars()
 {
     bool is32Bit = KittyMemoryEx::getMaps(kMgr.processID(), EProcMapFilter::EndWith, "/linker64").empty();
@@ -66,12 +75,12 @@ UEVarsInitStatus IGameProfile::InitUEVars()
     _UEVars.NamesPtr = GetNamesPtr();
     if (IsUsingFNamePool())
     {
-        if (!kPtrValidator.isPtrReadable(_UEVars.NamesPtr))
+        if (!canReadWithProvider(_UEVars.NamesPtr))
             return UEVarsInitStatus::ERROR_INIT_NAMEPOOL;
     }
     else
     {
-        if (!kPtrValidator.isPtrReadable(_UEVars.NamesPtr))
+        if (!canReadWithProvider(_UEVars.NamesPtr))
             return UEVarsInitStatus::ERROR_INIT_GNAMES;
     }
 
@@ -81,7 +90,7 @@ UEVarsInitStatus IGameProfile::InitUEVars()
     };
 
     _UEVars.GUObjectsArrayPtr = GetGUObjectArrayPtr();
-    if (!kPtrValidator.isPtrReadable(_UEVars.GUObjectsArrayPtr))
+    if (!canReadWithProvider(_UEVars.GUObjectsArrayPtr))
         return UEVarsInitStatus::ERROR_INIT_GUOBJECTARRAY;
 
     _UEVars.ObjObjectsPtr = _UEVars.GUObjectsArrayPtr + pOffsets->FUObjectArray.ObjObjects;
