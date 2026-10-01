@@ -652,6 +652,11 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "UStruct")
             {
+                if (offs.Config.isUsingStructBaseChain)
+                {
+                    add(offs.UStruct.SuperStruct - 0x10, 8, "void**",  "StructBaseChainArray");
+                    add(offs.UStruct.SuperStruct - 0x8,  4, "int32_t", "NumStructBasesInChainMinusOne");
+                }
                 add(offs.UStruct.PropertiesSize,  4, "int32_t",         "PropertiesSize");
                 add(offs.UStruct.SuperStruct,     8, "struct UStruct*", "SuperStruct");
                 add(offs.UStruct.Children,        8, "struct UField*",  "Children");
@@ -877,6 +882,18 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                     "\n"
                     "\tstatic struct UClass* FindClass(const std::string& ClassFullName);\n"
                     "\tstatic struct UClass* FindClassFast(const std::string& ClassName);\n";
+            }
+            else if (s.CppNameOnly == "UStruct" && offs.Config.isUsingStructBaseChain)
+            {
+                s.ExtraDecls =
+                    "\t// FStructBaseChain, the other base UStruct derives from: StructBaseChainArray is\n"
+                    "\t// the ancestry as a flat array of FStructBaseChain*, indexed by depth from the\n"
+                    "\t// root. Each element points at another UStruct's own subobject, which starts at\n"
+                    "\t// StructBaseChainArray, so BaseChainSelf() is what an element compares against.\n"
+                    "\tconst void* BaseChainSelf() const\n"
+                    "\t{\n"
+                    "\t\treturn static_cast<const void*>(&StructBaseChainArray);\n"
+                    "\t}\n";
             }
             else if (s.CppNameOnly == "UClass")
             {
@@ -1190,7 +1207,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 }
 
 
-static void EmitSDKFunctionsCppBodies(BufferFmt &buf)
+static void EmitSDKFunctionsCppBodies(BufferFmt &buf, bool structBaseChain)
 {
     buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 {
@@ -1271,7 +1288,32 @@ bool UObject::IsA(EClassCastFlags TypeFlags) const
     return HasTypeFlag(TypeFlags);
 }
 
-bool UObject::IsA(class UClass* cmp) const
+)AIOIMPL");
+    if (structBaseChain)
+        buf.append("{}", R"AIOIMPL(bool UObject::IsA(class UClass* cmp) const
+{
+    if (!cmp || !ClassPrivate) return false;
+    if (ClassPrivate == cmp) return true;
+    // UStruct::IsChildOf, the way the engine answers it: the ancestry array is indexed
+    // by the target's own depth, so this is a bounds check and one compare rather than
+    // a walk. UE fills the array for every UStruct it builds; the walk covers a struct
+    // caught before it was filled.
+    if (void** chain = ClassPrivate->StructBaseChainArray)
+    {
+        const int32_t depth = cmp->NumStructBasesInChainMinusOne;
+        return depth <= ClassPrivate->NumStructBasesInChainMinusOne
+            && chain[depth] == cmp->BaseChainSelf();
+    }
+    for (const struct UStruct* s = ClassPrivate->SuperStruct; s; s = s->SuperStruct)
+    {
+        if (s == cmp) return true;
+    }
+    return false;
+}
+
+)AIOIMPL");
+    else
+        buf.append("{}", R"AIOIMPL(bool UObject::IsA(class UClass* cmp) const
 {
     if (!cmp || !ClassPrivate) return false;
     for (const struct UStruct* s = ClassPrivate; s; s = s->SuperStruct)
@@ -1281,7 +1323,8 @@ bool UObject::IsA(class UClass* cmp) const
     return false;
 }
 
-bool UObject::IsDefaultObject() const
+)AIOIMPL");
+    buf.append("{}", R"AIOIMPL(bool UObject::IsDefaultObject() const
 {
     // EObjectFlags::ClassDefaultObject = 0x10
     return (ObjectFlags & 0x10u) != 0;
@@ -1470,6 +1513,7 @@ static void EmitSDKCoreFiles(
     const sdkcoregen::FNameLayout& fnameLayout,
     const sdkcoregen::UObjectArrayLayout& uobjArrayLayout,
     const std::unordered_map<std::string, std::string>& enumUnderlying,
+    bool structBaseChain,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
     outBuffersMap[prefix + "Basic.h"].append("{}",
@@ -1535,7 +1579,7 @@ static void EmitSDKCoreFiles(
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
         buf.append("namespace SDK\n{{\n\n");
-        EmitSDKFunctionsCppBodies(buf);
+        EmitSDKFunctionsCppBodies(buf, structBaseChain);
         EmitUClassGetFunctionBody(buf, /*emitInline=*/false);
         EmitPackageFunctionBodies(buf, corePkg, /*emitInline=*/false, enumUnderlying);
         buf.append("}} // namespace SDK\n");
@@ -1625,6 +1669,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
 
     sdkcoregen::FNameLayout fnameLayout;  // defaults: 8B, non-CP, non-outline (Cmp@0, Number@4)
     sdkcoregen::UObjectArrayLayout uobjArrayLayout;  // defaults: stride 0x18, Object@0, chunked 64K
+    bool structBaseChain = false;
     if (_profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets())
     {
         const UE_Offsets& o = *_profile->GetUEVars()->GetOffsets();
@@ -1634,6 +1679,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                        static_cast<int32_t>(o.FName.Number),
                        o.Config.isUsingCasePreservingName,
                        o.Config.isUsingOutlineNumberName};
+        structBaseChain = o.Config.isUsingStructBaseChain;
         uobjArrayLayout.ItemStride = o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18;
         uobjArrayLayout.ObjectOffset = static_cast<int32_t>(o.FUObjectItem.Object);
         uobjArrayLayout.NumElementsPerChunk = static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk);
@@ -1650,7 +1696,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         uobjArrayLayout.MaxChunksOffset   = pick(o.TUObjectArray.MaxChunks);
         uobjArrayLayout.NumChunksOffset   = pick(o.TUObjectArray.NumChunks);
     }
-    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, _sdkEnumUnderlying, outBuffersMap);
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
 
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)

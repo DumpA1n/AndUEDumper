@@ -18,6 +18,13 @@ struct UE_Offsets
         bool isUsingCasePreservingName = false;
         bool IsUsingFNamePool = false;
         bool isUsingOutlineNumberName = false;
+        // UStruct derives from FStructBaseChain (USTRUCT_FAST_ISCHILDOF_IMPL ==
+        // USTRUCT_ISCHILDOF_STRUCTARRAY): StructBaseChainArray and
+        // NumStructBasesInChainMinusOne occupy the 0x10 bytes before SuperStruct.
+        // Reflection does not expose them, and builds compiled without the struct
+        // array lay that span out differently, so only a build where the array has
+        // been confirmed sets this.
+        bool isUsingStructBaseChain = false;
     } Config;
     struct
     {
