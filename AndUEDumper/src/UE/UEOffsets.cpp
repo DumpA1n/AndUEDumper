@@ -208,6 +208,14 @@ std::string UE_Offsets::ToString() const
             kOUT_NEWLINE();
         }
 
+        kOUT_NS_BEGIN(FBoolProperty);
+        {
+            kOUT_NS_MEMBER_P(FBoolProperty, FieldSize);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
         kOUT_NS_BEGIN(FEnumProperty);
         {
             kOUT_NS_MEMBER_P(FEnumProperty, UnderlyingType);
@@ -518,6 +526,7 @@ namespace UE_DefaultOffsets
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
             offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
 
             // FFieldClass default layout: stable across UE 4.25 ~ 5.x.
             offsets.FFieldClass.Name = 0;
@@ -634,6 +643,7 @@ namespace UE_DefaultOffsets
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
             offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
 
             offsets.FFieldClass.Name = 0;
             offsets.FFieldClass.Id = offsets.FName.Size;
@@ -671,6 +681,7 @@ namespace UE_DefaultOffsets
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
             offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
 
             // FProperty.Size shifted relative to UE5_00_02; re-sync FEnumProperty tail.
             offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;

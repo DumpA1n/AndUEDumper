@@ -146,6 +146,14 @@ struct UE_Offsets
         // extra leading metadata pointer — prober writes the actual value back here.
         uintptr_t SubPropertyBase = 0;
     } FProperty;
+    // FBoolProperty declares FieldSize, ByteOffset, ByteMask and FieldMask as
+    // consecutive uint8 members, so FieldSize locates all four. Stock layouts put
+    // FieldSize at FProperty.Size; DeltaForce inserts one leading byte before it,
+    // which SubPropertyBase does not describe.
+    struct
+    {
+        uintptr_t FieldSize = 0;
+    } FBoolProperty;
     // FEnumProperty tail layout — order of UnderlyingType / Enum differs across builds.
     // Walker previously probed it inline; prober now writes back so synthesize sees it.
     struct

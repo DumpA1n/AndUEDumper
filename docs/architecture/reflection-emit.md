@@ -79,7 +79,7 @@ Phase B (augment):    现有的 fieldsFor / augment 逻辑统一作用于
 
 ### 3.3 FProperty 子类合成表（完整 13 个）
 
-> 所有子类 `Inherited` 取直接父类的 `Size`，自身段从 `SubPropertyBase` 起算（FBoolProperty 特殊：从 `FProperty.Size` 起算的 uint8 四元组）。
+> 所有子类 `Inherited` 取直接父类的 `Size`，自身段从 `SubPropertyBase` 起算（FBoolProperty 特殊：从 `FBoolProperty.FieldSize` 起算的 uint8 四元组）。
 
 | 子类 | 父类 | 自身字段 | 字段类型 | 字段大小 | 字段相对偏移（相对自身段起点） |
 |---|---|---|---|---|---|
@@ -89,7 +89,7 @@ Phase B (augment):    现有的 fieldsFor / augment 逻辑统一作用于
 | **FSoftClassProperty** | FClassProperty | — | — | — | 无新字段，Size = FClassProperty.Size |
 | **FArrayProperty** | FProperty | Inner | `struct FProperty*` | 8 | `+0` |
 | **FByteProperty** | FProperty | Enum | `struct UEnum*` | 8 | `+0` |
-| **FBoolProperty** | FProperty | FieldSize, ByteOffset, ByteMask, FieldMask | `uint8` × 4 | 1 × 4 | `FProperty.Size + 0/1/2/3`（**不**用 SubPropertyBase，FBool 跨版本稳定） |
+| **FBoolProperty** | FProperty | FieldSize, ByteOffset, ByteMask, FieldMask | `uint8` × 4 | 1 × 4 | `FBoolProperty.FieldSize + 0/1/2/3`（不用 SubPropertyBase；标准布局等于 `FProperty.Size`，DeltaForce 在其前多 1 字节，为 `FProperty.Size + 1`） |
 | **FEnumProperty** | FProperty | UnderlyingType, Enum | `struct FProperty*`, `struct UEnum*` | 8, 8 | `FEnumProperty.UnderlyingType`, `FEnumProperty.Enum`（双布局，新探测项） |
 | **FSetProperty** | FProperty | ElementProp | `struct FProperty*` | 8 | `+0` |
 | **FMapProperty** | FProperty | KeyProp, ValueProp | `struct FProperty*` × 2 | 8, 8 | `+0`, `+8` |
@@ -166,7 +166,7 @@ SizeOf(FClassProperty)      = SizeOf(FObjectPropertyBase) + 8
 SizeOf(FSoftClassProperty)  = SizeOf(FClassProperty)
 SizeOf(FArrayProperty)      = SubPropertyBase + 8
 SizeOf(FByteProperty)       = SubPropertyBase + 8
-SizeOf(FBoolProperty)       = align(FProperty.Size + 4, 8)
+SizeOf(FBoolProperty)       = align(FBoolProperty.FieldSize + 4, 8)
 SizeOf(FEnumProperty)       = max(FEnumProperty.UnderlyingType, FEnumProperty.Enum) + 8
 SizeOf(FSetProperty)        = SubPropertyBase + 8
 SizeOf(FMapProperty)        = SubPropertyBase + 16
@@ -228,10 +228,10 @@ else if (cppName == "FProperty")  // : FField (non-POD base, 见 §4.4)
 // FProperty 子类
 else if (cppName == "FBoolProperty")
 {
-    add(offs.FProperty.Size + 0, 1, "uint8_t", "FieldSize", true);
-    add(offs.FProperty.Size + 1, 1, "uint8_t", "ByteOffset", true);
-    add(offs.FProperty.Size + 2, 1, "uint8_t", "ByteMask", true);
-    add(offs.FProperty.Size + 3, 1, "uint8_t", "FieldMask", true);
+    add(offs.FBoolProperty.FieldSize + 0, 1, "uint8_t", "FieldSize", true);
+    add(offs.FBoolProperty.FieldSize + 1, 1, "uint8_t", "ByteOffset", true);
+    add(offs.FBoolProperty.FieldSize + 2, 1, "uint8_t", "ByteMask", true);
+    add(offs.FBoolProperty.FieldSize + 3, 1, "uint8_t", "FieldMask", true);
 }
 else if (cppName == "FStructProperty")
 {
@@ -278,7 +278,7 @@ else if (cppName == "FFieldPathProperty")
 // FSoftClassProperty 无新字段
 ```
 
-注意：所有 reflection 派生字段都用 `allowZeroOffset=true`，因为 `FBoolProperty.FieldSize` 在 `FProperty.Size + 0` 是合法的。
+注意：所有 reflection 派生字段都用 `allowZeroOffset=true`，因为合成结构体的成员偏移可以为 0（例如 `FFieldClass::Name`）。
 
 ## 6. preamble 改造（UECoreEmbed.hpp）
 

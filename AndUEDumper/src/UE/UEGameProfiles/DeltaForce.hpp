@@ -116,6 +116,8 @@ public:
             offsets.FProperty.PropertyFlags = offsets.FProperty.ElementSize + sizeof(int32_t);
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = offsets.FProperty.Offset_Internal + (sizeof(int32_t) * 3) + (sizeof(void *) * 4);
+            // A DFM-specific byte at FProperty.Size precedes the FBoolProperty quartet.
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size + sizeof(uint8_t);
         }
 
         return &offsets;

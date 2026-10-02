@@ -1463,22 +1463,22 @@ std::string UE_FByteProperty::GetTypeStr() const
 
 uint8_t UE_FBoolProperty::GetFieldSize() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize);
 }
 
 uint8_t UE_FBoolProperty::GetByteOffset() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 1);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 1);
 }
 
 uint8_t UE_FBoolProperty::GetByteMask() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 2);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 2);
 }
 
 uint8_t UE_FBoolProperty::GetFieldMask() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 3);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 3);
 }
 
 std::string UE_FBoolProperty::GetTypeStr() const

@@ -430,7 +430,7 @@ void UEDumper::SynthesizeReflectionTypes()
 
     sizeOf["FArrayProperty"]      = static_cast<uint32_t>(arrayInnerOff + sizeof(void *));
     sizeOf["FByteProperty"]       = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FBoolProperty"]       = align8(offs.FProperty.Size + 4);
+    sizeOf["FBoolProperty"]       = align8(offs.FBoolProperty.FieldSize + 4);
     sizeOf["FEnumProperty"]       = static_cast<uint32_t>(
         std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum) + sizeof(void *));
     sizeOf["FSetProperty"]        = static_cast<uint32_t>(setElemOff + sizeof(void *));
@@ -681,7 +681,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             // FField hierarchy (synthesized by SynthesizeReflectionTypes).
             // All offsets here are members of a synthesized empty Struct; pass
             // allowZeroOffset=true since legitimate offsets begin at 0 (e.g.
-            // FFieldClass::Name, FBoolProperty::FieldSize).
+            // FFieldClass::Name).
             else if (cppName == "FFieldClass")
             {
                 add(offs.FFieldClass.Name,       fnameSize, "FName",               "Name", true);
@@ -729,13 +729,10 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "FBoolProperty")
             {
-                // FBool tail is a stable 4-byte quartet at FProperty.Size, NOT
-                // SubPropertyBase — DFM-style leading metadata applies to pointer
-                // tail data (Struct/PropertyClass/Inner/...) not to FBool's bytes.
-                add(offs.FProperty.Size + 0, 1, "uint8_t", "FieldSize", true);
-                add(offs.FProperty.Size + 1, 1, "uint8_t", "ByteOffset", true);
-                add(offs.FProperty.Size + 2, 1, "uint8_t", "ByteMask", true);
-                add(offs.FProperty.Size + 3, 1, "uint8_t", "FieldMask", true);
+                add(offs.FBoolProperty.FieldSize + 0, 1, "uint8_t", "FieldSize", true);
+                add(offs.FBoolProperty.FieldSize + 1, 1, "uint8_t", "ByteOffset", true);
+                add(offs.FBoolProperty.FieldSize + 2, 1, "uint8_t", "ByteMask", true);
+                add(offs.FBoolProperty.FieldSize + 3, 1, "uint8_t", "FieldMask", true);
             }
             else if (cppName == "FEnumProperty")
             {
