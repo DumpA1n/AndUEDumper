@@ -1208,11 +1208,15 @@ static void EmitSDKFunctionsCppBodies(BufferFmt &buf, bool structBaseChain)
 {
     buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
 {
-    using FN = void(*)(const UObject*, struct UFunction*, void*);
     check(Function);
+#ifdef SDK_PROCESS_EVENT
+    SDK_PROCESS_EVENT(const_cast<UObject*>(this), Function, Parms);
+#else
+    using FN = void(*)(const UObject*, struct UFunction*, void*);
     auto vtbl = *reinterpret_cast<void* const* const*>(this);
     check(vtbl);
     reinterpret_cast<FN>(vtbl[kProcessEventIndex])(this, Function, Parms);
+#endif
 }
 
 class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
@@ -1509,12 +1513,13 @@ static void EmitSDKCoreFiles(
     int processEventIndex,
     const sdkcoregen::FNameLayout& fnameLayout,
     const sdkcoregen::UObjectArrayLayout& uobjArrayLayout,
+    const sdkcoregen::FTextLayout& textLayout,
     const std::unordered_map<std::string, std::string>& enumUnderlying,
     bool structBaseChain,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
     outBuffersMap[prefix + "Basic.h"].append("{}",
-        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout)));
+        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout, textLayout)));
     outBuffersMap[prefix + "Basic.cpp"].append("{}",
         RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
@@ -1575,6 +1580,11 @@ static void EmitSDKCoreFiles(
         buf.append("#include \"Basic.h\"\n");
         buf.append("#include \"CoreUObject_classes.hpp\"\n");
         buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
+        buf.append("// A consumer routes UObject::ProcessEvent through its own dispatcher by defining\n");
+        buf.append("// SDK_PROCESS_EVENT as a callable taking (UObject*, UFunction*, void*), and\n");
+        buf.append("// SDK_PROCESS_EVENT_INCLUDE as the header that declares it. Otherwise the call\n");
+        buf.append("// goes through the object's vtable at kProcessEventIndex.\n");
+        buf.append("#ifdef SDK_PROCESS_EVENT_INCLUDE\n#include SDK_PROCESS_EVENT_INCLUDE\n#endif\n\n");
         buf.append("namespace SDK\n{{\n\n");
         EmitSDKFunctionsCppBodies(buf, structBaseChain);
         EmitUClassGetFunctionBody(buf, /*emitInline=*/false);
@@ -1666,6 +1676,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
 
     sdkcoregen::FNameLayout fnameLayout;  // defaults: 8B, non-CP, non-outline (Cmp@0, Number@4)
     sdkcoregen::UObjectArrayLayout uobjArrayLayout;  // defaults: stride 0x18, Object@0, chunked 64K
+    sdkcoregen::FTextLayout textLayout;  // defaults: TextSource@0x28, no virtual display string
     bool structBaseChain = false;
     if (_profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets())
     {
@@ -1677,6 +1688,10 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
                        o.Config.isUsingCasePreservingName,
                        o.Config.isUsingOutlineNumberName};
         structBaseChain = o.Config.isUsingStructBaseChain;
+        if (o.FTextData.TextSource)
+            textLayout.TextSource = static_cast<int32_t>(o.FTextData.TextSource);
+        if (o.FTextData.GetDisplayString)
+            textLayout.GetDisplayStringIndex = static_cast<int32_t>(o.FTextData.GetDisplayString);
         uobjArrayLayout.ItemStride = o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18;
         uobjArrayLayout.ObjectOffset = static_cast<int32_t>(o.FUObjectItem.Object);
         uobjArrayLayout.NumElementsPerChunk = static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk);
@@ -1693,7 +1708,7 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         uobjArrayLayout.MaxChunksOffset   = pick(o.TUObjectArray.MaxChunks);
         uobjArrayLayout.NumChunksOffset   = pick(o.TUObjectArray.NumChunks);
     }
-    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
 
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)

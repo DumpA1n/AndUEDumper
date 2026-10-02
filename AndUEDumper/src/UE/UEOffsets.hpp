@@ -154,6 +154,16 @@ struct UE_Offsets
     {
         uintptr_t FieldSize = 0;
     } FBoolProperty;
+    // FTextImpl::FTextData, the ITextData that FText::TextData points at.
+    // GetDisplayString is the vtable slot of ITextData::GetDisplayString; zero
+    // leaves the emitted FText reading TextSource, the source string that the base
+    // text history embeds (zero keeps the stock 0x28). Implementations keep their
+    // display strings in different members, so only the virtual covers them all.
+    struct
+    {
+        uintptr_t TextSource = 0;
+        uintptr_t GetDisplayString = 0;
+    } FTextData;
     // FEnumProperty tail layout — order of UnderlyingType / Enum differs across builds.
     // Walker previously probed it inline; prober now writes back so synthesize sees it.
     struct

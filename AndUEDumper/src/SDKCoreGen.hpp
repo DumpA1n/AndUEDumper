@@ -40,6 +40,17 @@ struct UObjectArrayLayout
     int32_t NumChunksOffset = -1;    // NumChunks within TUObjectArray       (canon 0x1C)
 };
 
+// Drives the emitted FTextImpl::FTextData, the ITextData that FText::TextData
+// points at. Each ITextData implementation keeps its display string in a different
+// member, so when GetDisplayStringIndex names the vtable slot of the virtual
+// ITextData::GetDisplayString, FText calls it. Otherwise FText reads TextSource,
+// the source string that the base text history embeds at a fixed offset.
+struct FTextLayout
+{
+    int32_t TextSource = 0x28;
+    int32_t GetDisplayStringIndex = -1;
+};
+
 namespace detail
 {
 inline std::string hx(unsigned long v)
@@ -200,6 +211,47 @@ inline std::string GenFSoftObjectPath(const FNameLayout& L)
     s += "static_assert(offsetof(FSoftObjectPath, AssetPathName) == 0x0, \"Member 'FSoftObjectPath::AssetPathName' has a wrong offset!\");\n";
     s += "static_assert(offsetof(FSoftObjectPath, SubPathString) == " + hx(subOff) + ", \"Member 'FSoftObjectPath::SubPathString' has a wrong offset!\");\n";
     s += "}\n";
+    return s;
+}
+
+inline std::string GenFText(const FTextLayout& L)
+{
+    using detail::hx;
+    const bool virtualDisplay = L.GetDisplayStringIndex >= 0;
+    std::string s;
+    s += "namespace FTextImpl\n{\n";
+    s += "class FTextData final\n{\npublic:\n";
+    if (virtualDisplay)
+    {
+        s += "\tvoid**                                        VTable;\n\n";
+        s += "public:\n";
+        s += "\tconst class FString& GetDisplayString() const\n\t{\n";
+        s += "\t\tusing GetDisplayStringFn = const class FString& (*)(const FTextData*);\n";
+        s += "\t\treturn reinterpret_cast<GetDisplayStringFn>(VTable[" + std::to_string(L.GetDisplayStringIndex) + "])(this);\n\t}\n";
+        s += "};\n";
+    }
+    else
+    {
+        if (L.TextSource > 0)
+            s += "\tuint8                                         Pad_0[" + hx(L.TextSource) + "];\n";
+        s += "\tclass FString                                 TextSource;\n";
+        s += "};\n";
+        s += "static_assert(offsetof(FTextData, TextSource) == " + hx(L.TextSource) + ", \"Member 'FTextData::TextSource' has a wrong offset!\");\n";
+    }
+    s += "}\n\n";
+
+    s += "class FText final\n{\npublic:\n";
+    s += "\tclass FTextImpl::FTextData*                   TextData;\n";
+    s += "\tuint8                                         Pad_8[0x10];\n\n";
+    s += "public:\n";
+    s += "\tconst class FString& GetStringRef() const\n\t{\n";
+    s += "\t\tstatic const class FString Empty{};\n";
+    s += std::string("\t\treturn TextData ? TextData->") + (virtualDisplay ? "GetDisplayString()" : "TextSource") + " : Empty;\n\t}\n";
+    s += "\tstd::string ToString() const\n\t{\n";
+    s += "\t\treturn TextData ? GetStringRef().ToString() : std::string();\n\t}\n";
+    s += "\tbool IsValid() const\n\t{\n\t\treturn TextData != nullptr;\n\t}\n";
+    s += "};\n";
+    s += "static_assert(sizeof(FText) == 0x18, \"Wrong size on FText\");\n";
     return s;
 }
 
@@ -467,7 +519,8 @@ public:
 }
 
 // Replace the @@SDK_GEN_*@@ placeholders in kUECoreBasicH with generated code.
-inline std::string SpliceLayoutCoreTypes(std::string content, const FNameLayout& L, const UObjectArrayLayout& UA)
+inline std::string SpliceLayoutCoreTypes(std::string content, const FNameLayout& L, const UObjectArrayLayout& UA,
+                                         const FTextLayout& T)
 {
     struct Sub { const char* tok; std::string code; };
     const Sub subs[] = {
@@ -476,6 +529,7 @@ inline std::string SpliceLayoutCoreTypes(std::string content, const FNameLayout&
         {"// @@SDK_GEN_FNAME@@", GenFName(L)},
         {"// @@SDK_GEN_FSCRIPTDELEGATE@@", GenFScriptDelegate(L)},
         {"// @@SDK_GEN_FSOFTOBJECTPATH@@", GenFSoftObjectPath(L)},
+        {"// @@SDK_GEN_FTEXT@@", GenFText(T)},
     };
     for (const auto& sub : subs)
     {

@@ -216,6 +216,15 @@ std::string UE_Offsets::ToString() const
             kOUT_NEWLINE();
         }
 
+        kOUT_NS_BEGIN(FTextData);
+        {
+            kOUT_NS_MEMBER_P(FTextData, TextSource);
+            kOUT_NS_MEMBER_P(FTextData, GetDisplayString);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
         kOUT_NS_BEGIN(FEnumProperty);
         {
             kOUT_NS_MEMBER_P(FEnumProperty, UnderlyingType);

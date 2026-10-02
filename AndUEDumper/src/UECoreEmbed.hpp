@@ -357,44 +357,7 @@ public:
 	}
 };
 
-namespace FTextImpl
-{
-// Predefined struct FTextData
-// 0x0038 (0x0038 - 0x0000)
-class FTextData final
-{
-public:
-	uint8                                         Pad_0[0x28];                                       // 0x0000(0x0028)(Fixing Size After Last Property [ Dumper-7 ])
-	class FString                                 TextSource;                                        // 0x0028(0x0010)(NOT AUTO-GENERATED PROPERTY)
-};
-}
-
-// Predefined struct FText
-// 0x0018 (0x0018 - 0x0000)
-class FText final
-{
-public:
-	class FTextImpl::FTextData*                   TextData;                                          // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
-	uint8                                         Pad_8[0x10];                                       // 0x0008(0x0010)(Fixing Struct Size After Last Property [ Dumper-7 ])
-
-public:
-	const class FString& GetStringRef() const
-	{
-		if (!TextData)
-			return FString();
-		return TextData->TextSource;
-	}
-	std::string ToString() const
-	{
-		if (!TextData)
-			return "";
-		return TextData->TextSource.ToString();
-	}
-	bool IsValid() const
-	{
-		return TextData != nullptr;
-	}
-};
+// @@SDK_GEN_FTEXT@@
 
 class FWeakObjectPtr
 {

@@ -118,6 +118,8 @@ public:
             offsets.FProperty.Size = offsets.FProperty.Offset_Internal + (sizeof(int32_t) * 3) + (sizeof(void *) * 4);
             // A DFM-specific byte at FProperty.Size precedes the FBoolProperty quartet.
             offsets.FBoolProperty.FieldSize = offsets.FProperty.Size + sizeof(uint8_t);
+            // ITextData's vtable leads with the two destructors and OwnsLocalizedString.
+            offsets.FTextData.GetDisplayString = 3;
         }
 
         return &offsets;
