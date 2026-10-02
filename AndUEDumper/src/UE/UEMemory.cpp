@@ -13,6 +13,11 @@ namespace UEMemory
         return kMgr.readMem(uintptr_t(address), result, len) == len;
     }
 
+    bool IsPtrReadable(uintptr_t address)
+    {
+        return kPtrValidator.isPtrReadable(address);
+    }
+
     std::string vm_rpm_str(const void *address, size_t max_len)
     {
         std::vector<char> chars(max_len, '\0');

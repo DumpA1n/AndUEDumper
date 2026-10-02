@@ -17,6 +17,10 @@ namespace UEMemory
 
     bool vm_rpm_ptr(const void *address, void *result, size_t len);
 
+    // True when a pointer-sized value at address can be read through the memory
+    // channel that vm_rpm_ptr uses. A failed check is not a read failure.
+    bool IsPtrReadable(uintptr_t address);
+
     template <typename T>
     T vm_rpm_ptr(const void *address)
     {

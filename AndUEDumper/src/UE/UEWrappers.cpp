@@ -1380,7 +1380,7 @@ namespace
             uintptr_t inner = 0;
             if (!vm_rpm_ptr((void *)(propObject + off), &inner, sizeof(uintptr_t))) continue;
             if (!inner) continue;
-            if (!kPtrValidator.isPtrReadable(inner)) continue;
+            if (!IsPtrReadable(inner)) continue;
             return off;
         }
         return 0;
@@ -1578,7 +1578,7 @@ UE_FProperty UE_FMapProperty::GetValueProp() const
     {
         uintptr_t inner = 0;
         if (vm_rpm_ptr((void *)(object + offs->FMapProperty.ValueProp), &inner, sizeof(uintptr_t))
-            && inner && kPtrValidator.isPtrReadable(inner))
+            && inner && IsPtrReadable(inner))
         {
             return UE_FProperty((uint8_t *)inner);
         }
