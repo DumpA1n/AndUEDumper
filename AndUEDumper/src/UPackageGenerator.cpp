@@ -517,7 +517,6 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
     uint64_t pairSize = nameSize + sizeof(int64_t);
 
     auto names = object.GetNames();
-    uint64_t max = 0;
 
     std::unordered_set<std::string> seenEnumNames;
     for (int32_t i = 0; i < names.Num(); i++)
@@ -530,8 +529,6 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
             str = str.substr(pos + 1);
 
         auto value = vm_rpm_ptr<uint64_t>(pair + nameSize);
-        if (value > max)
-            max = value;
 
         std::string sanitized = SanitizeIdentForCpp(str);
         // drop duplicate enumerator names (C++ rejects redefinition)
@@ -557,21 +554,38 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
 
     if (isUninitializedEnum(e))
     {
-        max = e.Members.size();
         for (size_t i = 0; i < e.Members.size(); ++i)
         {
             e.Members[i].second = i;
         }
     }
 
-    if (max > GetMaxOfType<uint32_t>())
-        e.UnderlyingType = "uint64_t";
-    else if (max > GetMaxOfType<uint16_t>())
-        e.UnderlyingType = "uint32_t";
-    else if (max > GetMaxOfType<uint8_t>())
-        e.UnderlyingType = "uint16_t";
-    else
-        e.UnderlyingType = "uint8_t";
+    // UEnum::SetEnums appends a generated <Prefix>_MAX key one past the largest value. The
+    // engine's C++ enum never declares it, so it does not bound the underlying type: an
+    // enum whose values end at 255 is a uint8 enum even though its _MAX is 256. The key is
+    // kept only where the chosen type can represent it.
+    const bool generatedMax = !e.Members.empty() && e.Members.back().first.ends_with("_MAX");
+    const size_t valueCount = e.Members.size() - (generatedMax ? 1 : 0);
+    uint64_t max = 0;
+    for (size_t i = 0; i < valueCount; ++i)
+    {
+        if (e.Members[i].second > max)
+            max = e.Members[i].second;
+    }
+
+    struct Width { const char *type; uint64_t max; };
+    static constexpr Width kWidths[] = {
+        {"uint8_t", GetMaxOfType<uint8_t>()},
+        {"uint16_t", GetMaxOfType<uint16_t>()},
+        {"uint32_t", GetMaxOfType<uint32_t>()},
+        {"uint64_t", UINT64_MAX},
+    };
+    const Width *width = kWidths;
+    while (max > width->max)
+        ++width;
+    e.UnderlyingType = width->type;
+    if (generatedMax && e.Members.back().second > width->max)
+        e.Members.pop_back();
 
     e.CppNameOnly = SanitizeIdentifier(object.GetName());
     e.CppName = "enum class " + e.CppNameOnly + " : " + e.UnderlyingType;

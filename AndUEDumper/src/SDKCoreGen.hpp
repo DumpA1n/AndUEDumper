@@ -860,17 +860,12 @@ TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
 // as static_asserts so that becomes a build error at the point it is introduced.
 //
 // An assert can only be emitted where the declaration is able to match the dump at all.
-// Two dumped conditions make it unable to, and both are properties of a struct rather
-// than of the member being checked, so they propagate to anything built on it:
-//
-//   * A member whose dumped offset lies below the struct's Inherited boundary.
-//     PackBaseTailPadding lowers Inherited to the base's declared data size wherever the
-//     base's declaration can end before the struct's first member, so a member still below
-//     it lies inside the base's declared data and C++ places the whole struct at a skew
-//     from its dumped offsets.
-//   * A member declared with an enum whose underlying type is wider than the member's
-//     dumped size. The enum's width follows its largest enumerator, which the engine need
-//     not honour when it stores the value in a narrower property.
+// A member whose dumped offset lies below the struct's Inherited boundary makes it unable
+// to. PackBaseTailPadding lowers Inherited to the base's declared data size wherever the
+// base's declaration can end before the struct's first member, so a member still below it
+// lies inside the base's declared data and C++ places the whole struct at a skew from its
+// dumped offsets. That is a property of the struct rather than of the member being
+// checked, so it propagates to anything built on it.
 //
 // A struct also inherits the condition from its base and from the type of any
 // struct-valued member, because its own offsets are then computed over a type whose C++
@@ -882,12 +877,11 @@ struct LayoutGuardStats
     size_t CheckedStructs = 0;
     size_t CheckedMembers = 0;
     size_t SkippedBaseOverlap = 0;      // own member inside the base's declared data
-    size_t SkippedEnumWidth = 0;        // own member narrower than its enum
     size_t SkippedPropagated = 0;       // through a base or a struct-valued member
 
     size_t SkippedStructs() const
     {
-        return SkippedBaseOverlap + SkippedEnumWidth + SkippedPropagated;
+        return SkippedBaseOverlap + SkippedPropagated;
     }
 };
 
@@ -1013,8 +1007,7 @@ CoreTypeSizes ObserveCoreTypeSizes(const std::vector<StructT*>& structs)
 // in the dump, across all packages, because a base or a member's type routinely lives in
 // another one. Returns what was checked and what was not.
 template <typename StructT>
-LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
-                                    const std::unordered_map<std::string, std::string>& enumUnderlying)
+LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs)
 {
     using detail::hx;
     LayoutGuardStats stats;
@@ -1032,7 +1025,6 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
     {
         None,
         BaseOverlap,      // a member of this struct lies inside its base's declared data
-        EnumWidth,        // a member of this struct is narrower than its enum
         Base,             // the base cannot be checked
         MemberType,       // a struct-valued member's type cannot be checked
         MemberTypeSize,   // a member's size disagrees with its own type's dumped size
@@ -1047,17 +1039,6 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
             if (m.Offset < s.Inherited)
             {
                 skip[i] = Skip::BaseOverlap;
-                break;
-            }
-            if (detail::IsBitField(m.Name))
-                continue;
-            auto e = enumUnderlying.find(detail::BareTypeName(m.Type));
-            if (e == enumUnderlying.end())
-                continue;
-            const int32_t width = detail::IntegerWidth(e->second);
-            if (width > 0 && static_cast<uint32_t>(width * detail::DeclaredArrayDim(m.Name)) != m.Size)
-            {
-                skip[i] = Skip::EnumWidth;
                 break;
             }
         }
@@ -1111,10 +1092,6 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
             case Skip::BaseOverlap:
                 ++stats.SkippedBaseOverlap;
                 why = "a member lies inside its base's declared data";
-                break;
-            case Skip::EnumWidth:
-                ++stats.SkippedEnumWidth;
-                why = "a member is narrower than the enum it is declared with";
                 break;
             case Skip::Base:
                 ++stats.SkippedPropagated;

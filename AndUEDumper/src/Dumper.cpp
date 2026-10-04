@@ -520,6 +520,95 @@ void UEDumper::SynthesizeReflectionTypes()
     }
 }
 
+// Settle each enum's underlying type against the members that store it. Runs over every
+// package at once, because an enum and the structs holding it usually live in different
+// ones.
+//
+// GenerateEnum infers a width from the enumerator values, which only bound the engine's
+// underlying type from below; the dumped size of a member declared with the enum is that
+// type. When every member storing an enum has the same width, and that width holds all of
+// its values, the enum takes it. The ProcessEvent parameter blocks declare parameters with
+// the enum type and carry no dumped offsets to check them, so they are only right if the
+// enum is.
+//
+// A member that still disagrees, because the enum is stored at several widths or a value
+// does not fit the storage width, is declared as the unsigned integer of its dumped width
+// with the enum named in its comment. Every member is then as wide as the dump says, which
+// the layout guards rely on.
+static void SettleEnumWidths(std::vector<UE_UPackage> &packages)
+{
+    using sdkcoregen::detail::BareTypeName;
+    using sdkcoregen::detail::DeclaredArrayDim;
+    using sdkcoregen::detail::IntegerWidth;
+    using sdkcoregen::detail::IsBitField;
+
+    auto integerType = [](uint32_t width) -> const char *
+    {
+        switch (width)
+        {
+        case 1: return "uint8_t";
+        case 2: return "uint16_t";
+        case 4: return "uint32_t";
+        case 8: return "uint64_t";
+        default: return nullptr;
+        }
+    };
+    // Width of one element; 0 when the size is not a whole number of elements.
+    auto elementWidth = [](const UE_UPackage::Member &m) -> uint32_t
+    {
+        const uint32_t dim = static_cast<uint32_t>(DeclaredArrayDim(m.Name));
+        return m.Size % dim == 0 ? m.Size / dim : 0;
+    };
+
+    std::unordered_map<std::string, UE_UPackage::Enum *> enums;
+    for (auto &p : packages)
+        for (auto &e : p.Enums)
+            enums.emplace(e.CppNameOnly, &e);
+
+    const std::vector<UE_UPackage::Struct *> structs = CollectStructs(packages);
+    auto forEachEnumMember = [&](auto &&fn)
+    {
+        for (auto *s : structs)
+            for (auto &m : s->Members)
+            {
+                if (IsBitField(m.Name))
+                    continue;
+                auto it = enums.find(BareTypeName(m.Type));
+                if (it != enums.end())
+                    fn(m, *it->second);
+            }
+    };
+
+    // 0 marks an enum stored at more than one width.
+    std::unordered_map<UE_UPackage::Enum *, uint32_t> storage;
+    forEachEnumMember([&](UE_UPackage::Member &m, UE_UPackage::Enum &e)
+    {
+        auto [it, inserted] = storage.emplace(&e, elementWidth(m));
+        if (!inserted && it->second != elementWidth(m))
+            it->second = 0;
+    });
+    for (auto [e, width] : storage)
+    {
+        const char *type = integerType(width);
+        if (!type || width <= static_cast<uint32_t>(IntegerWidth(e->UnderlyingType)))
+            continue;
+        e->UnderlyingType = type;
+        e->CppName = "enum class " + e->CppNameOnly + " : " + e->UnderlyingType;
+    }
+
+    forEachEnumMember([&](UE_UPackage::Member &m, UE_UPackage::Enum &e)
+    {
+        const uint32_t width = elementWidth(m);
+        const char *type = integerType(width);
+        if (!type || width == static_cast<uint32_t>(IntegerWidth(e.UnderlyingType)))
+            return;
+        if (!m.extra.empty())
+            m.extra += ", ";
+        m.extra += "holds " + e.CppNameOnly + " (" + e.UnderlyingType + ")";
+        m.Type = type;
+    });
+}
+
 void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback)
 {
     _sdkProcessed.clear();
@@ -1083,6 +1172,8 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
 
     if (_sdkProcessed.empty())
         return;
+
+    SettleEnumWidths(_sdkProcessed);
 
     _sdkNameToPkg.reserve(_sdkProcessed.size() * 64);
 
@@ -1724,12 +1815,12 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     const std::vector<UE_UPackage::Struct *> allStructs = CollectStructs(_sdkProcessed);
     const sdkcoregen::CoreTypeSizes coreTypeSizes = sdkcoregen::ObserveCoreTypeSizes(allStructs);
     const sdkcoregen::LayoutGuardStats guardStats =
-        sdkcoregen::AppendLayoutGuards(allStructs, _sdkEnumUnderlying);
+        sdkcoregen::AppendLayoutGuards(allStructs);
     logsBufferFmt.append(
         "SDK layout guards: {} structs / {} members checked; {} structs unchecked "
-        "(base overlap: {}, enum width: {}, propagated: {})\n",
+        "(base overlap: {}, propagated: {})\n",
         guardStats.CheckedStructs, guardStats.CheckedMembers, guardStats.SkippedStructs(),
-        guardStats.SkippedBaseOverlap, guardStats.SkippedEnumWidth, guardStats.SkippedPropagated);
+        guardStats.SkippedBaseOverlap, guardStats.SkippedPropagated);
 
     EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, coreTypeSizes, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
 
