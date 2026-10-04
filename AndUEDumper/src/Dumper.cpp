@@ -1514,12 +1514,14 @@ static void EmitSDKCoreFiles(
     const sdkcoregen::FNameLayout& fnameLayout,
     const sdkcoregen::UObjectArrayLayout& uobjArrayLayout,
     const sdkcoregen::FTextLayout& textLayout,
+    const sdkcoregen::CoreTypeSizes& coreTypeSizes,
     const std::unordered_map<std::string, std::string>& enumUnderlying,
     bool structBaseChain,
     std::unordered_map<std::string, BufferFmt>& outBuffersMap)
 {
     outBuffersMap[prefix + "Basic.h"].append("{}",
-        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout, textLayout)));
+        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout, textLayout,
+                                                       coreTypeSizes)));
     outBuffersMap[prefix + "Basic.cpp"].append("{}",
         RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
     outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
@@ -1708,7 +1710,27 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
         uobjArrayLayout.MaxChunksOffset   = pick(o.TUObjectArray.MaxChunks);
         uobjArrayLayout.NumChunksOffset   = pick(o.TUObjectArray.NumChunks);
     }
-    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
+    // Layout guards, over every struct in the dump at once: a struct's base and the types
+    // of its members routinely live in other packages, and both decide whether its own
+    // offsets are checkable. Runs before any header is emitted, since it writes the asserts
+    // into each struct's Trailer. AIOHeader.hpp is already emitted by this point and stays
+    // assert-free — it is a browsing aid, not a compilation entry point.
+    std::vector<UE_UPackage::Struct *> allStructs;
+    for (auto &pkg : _sdkProcessed)
+    {
+        for (auto &s : pkg.Structures) allStructs.push_back(&s);
+        for (auto &c : pkg.Classes)    allStructs.push_back(&c);
+    }
+    const sdkcoregen::CoreTypeSizes coreTypeSizes = sdkcoregen::ObserveCoreTypeSizes(allStructs);
+    const sdkcoregen::LayoutGuardStats guardStats =
+        sdkcoregen::AppendLayoutGuards(allStructs, _sdkEnumUnderlying);
+    logsBufferFmt.append(
+        "SDK layout guards: {} structs / {} members checked; {} structs unchecked "
+        "(base tail packing: {}, enum width: {}, propagated: {})\n",
+        guardStats.CheckedStructs, guardStats.CheckedMembers, guardStats.SkippedStructs(),
+        guardStats.SkippedBaseTailPacking, guardStats.SkippedEnumWidth, guardStats.SkippedPropagated);
+
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, coreTypeSizes, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
 
     size_t nonCorePkgCount = 0;
     for (size_t pkgIdx : _sdkPkgOrder)

@@ -409,14 +409,22 @@ static_assert(offsetof(FUniqueObjectGuid, C) == 0x000008, "Member 'FUniqueObject
 static_assert(offsetof(FUniqueObjectGuid, D) == 0x00000C, "Member 'FUniqueObjectGuid::D' has a wrong offset!");
 
 // Predefined struct TPersistentObjectPtr
-// 0x0000 (0x0000 - 0x0000)
+//
+// Size and the ObjectID offset both depend on TObjectID: ObjectID sits at the first
+// alignof(TObjectID)-aligned offset at or past 0x000C, and the struct ends after it. The
+// two instantiations the SDK uses come out as:
+//   TPersistentObjectPtr<FUniqueObjectGuid>              ObjectID @ 0x000C, size 0x001C
+//   TPersistentObjectPtr<FakeSoftObjectPtr::FSoftObjectPath>  ObjectID @ 0x0010, size 0x0028
+// Basic.h asserts both against the widths the dump gave TLazyObjectPtr and
+// TSoftObjectPtr members, because this is where a wrong TObjectID width turns into a
+// wrong offset for every generated member that follows such a pointer.
 template<typename TObjectID>
 class TPersistentObjectPtr
 {
 public:
 	FWeakObjectPtr                                WeakPtr;                                           // 0x0000(0x0008)(NOT AUTO-GENERATED PROPERTY)
 	int32                                         TagAtLastTest;                                     // 0x0008(0x0004)(NOT AUTO-GENERATED PROPERTY)
-	TObjectID                                     ObjectID;                                          // 0x000C(0x0000)(NOT AUTO-GENERATED PROPERTY)
+	TObjectID                                     ObjectID;                                          // alignof(TObjectID)-aligned, >= 0x000C (NOT AUTO-GENERATED PROPERTY)
 
 public:
 	class UObject* Get() const
@@ -964,6 +972,8 @@ public:
 };
 
 }
+
+// @@SDK_GEN_CORETYPE_GUARDS@@
 
 }
 )UECoreBasicH";
