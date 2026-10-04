@@ -1,5 +1,6 @@
 #include "UPackageGenerator.hpp"
 
+#include <algorithm>
 #include <optional>
 #include <unordered_set>
 
@@ -345,7 +346,28 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         s.FullDeps.insert(s.SuperCppName);
     }
 
+    // The engine places a derived struct's first members in its base's tail padding
+    // whenever the base's native type permits it, so an own member can sit below the
+    // base's size. Laying out from the lowest own offset keeps every member at its dumped
+    // offset; sdkcoregen::PackBaseTailPadding then ends the base's declaration before it.
     uint32_t offset = s.Inherited;
+    auto lowerToOwnMember = [&](IProperty *prop)
+    {
+        if (prop->GetSize() * prop->GetArrayDim() > 0)
+            offset = std::min(offset, static_cast<uint32_t>(prop->GetOffset()));
+    };
+    for (auto prop = object.GetChildProperties().Cast<UE_FProperty>(); prop; prop = prop.GetNext().Cast<UE_FProperty>())
+    {
+        auto propInterface = prop.GetInterface();
+        lowerToOwnMember(&propInterface);
+    }
+    for (auto child = object.GetChildren(); child; child = child.GetNext())
+    {
+        if (!child.IsA<UE_UProperty>())
+            continue;
+        auto propInterface = child.Cast<UE_UProperty>().GetInterface();
+        lowerToOwnMember(&propInterface);
+    }
     uint8_t bitOffset = 0;
     std::unordered_set<std::string> scopeIdentifiers;
 

@@ -132,6 +132,17 @@ namespace SDK {
 
 using namespace UC;
 
+// Empty base of a generated root struct whose tail padding a derived struct occupies.
+// Having a base makes the struct non-POD for the purpose of layout, which is what lets the
+// Itanium C++ ABI place derived members in that padding, as the engine's own non-POD type
+// did; the struct stays trivial, trivially copyable and standard-layout. Each struct
+// instantiates it with itself, so no two base subobjects of one empty type ever have to
+// share an address. Aggregate initialization of such a struct takes a leading {} for it.
+template<typename>
+struct TTailPaddingReusable
+{
+};
+
 namespace InSDKUtils
 {
 	inline uintptr_t s_ImageBase = 0;

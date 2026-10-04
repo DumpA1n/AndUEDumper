@@ -49,6 +49,19 @@ namespace dumper_jf_ns
     }
 }  // namespace dumper_jf_ns
 
+// Every struct and class of every package, for the passes that need a struct's base and
+// member types, which routinely live in other packages.
+static std::vector<UE_UPackage::Struct *> CollectStructs(std::vector<UE_UPackage> &packages)
+{
+    std::vector<UE_UPackage::Struct *> all;
+    for (auto &pkg : packages)
+    {
+        for (auto &s : pkg.Structures) all.push_back(&s);
+        for (auto &c : pkg.Classes)    all.push_back(&c);
+    }
+    return all;
+}
+
 bool UEDumper::Init(IGameProfile *profile)
 {
     UEVarsInitStatus initStatus = profile->InitUEVars();
@@ -106,6 +119,13 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
     }
 
     BuildProcessedPackages(packages, _dumpProgressCallback);
+
+    // Rewrites declarations, so it precedes every header, AIOHeader.hpp included.
+    const sdkcoregen::TailPaddingStats tailStats =
+        sdkcoregen::PackBaseTailPadding(CollectStructs(_sdkProcessed));
+    logsBufferFmt.append(
+        "SDK base tail padding: {} bases reused ({} roots marked, {} emptied); {} unresolved\n",
+        tailStats.ReusedBases, tailStats.MarkedRoots, tailStats.EmptiedBases, tailStats.UnresolvedBases);
 
     outBuffersMap->insert({"AIOHeader.hpp", BufferFmt()});
     BufferFmt &aioBufferFmt = outBuffersMap->at("AIOHeader.hpp");
@@ -445,11 +465,7 @@ void UEDumper::SynthesizeReflectionTypes()
         // FField hierarchy
         { "FFieldClass",         "" },
         { "FField",              "" },
-        // FProperty : FField. FField is emitted non-POD (~FField(){} + no trailing
-        // pad, see augment) so the Itanium ABI lets FProperty pack ArrayDim into
-        // FField's [0x34,0x38) tail padding — matching real UE. Inherited is set to
-        // FField's DATA extent (0x34), not sizeof (0x38). NDK/Itanium only: MSVC
-        // never reuses base tail padding (would shift ArrayDim to 0x38).
+        // FProperty : FField. FProperty's Inherited is FField's data extent; see below.
         { "FProperty",           "FField" },
         // direct FProperty subclasses
         { "FStructProperty",     "FProperty" },
@@ -491,10 +507,10 @@ void UEDumper::SynthesizeReflectionTypes()
             auto pit = sizeOf.find(t.parent);
             s.Inherited = pit != sizeOf.end() ? pit->second : 0;
         }
-        // FProperty's fields start at FField's DATA extent (FlagsPrivate+4 = 0x34),
-        // NOT sizeof(FField) (0x38). FField is non-POD (see augment) so the derived
-        // class reuses its tail pad: standard layout packs ArrayDim @ 0x34; alt
-        // layouts (DFM, ArrayDim @ 0x38) get a leading Pad_0x34 then ArrayDim.
+        // FProperty's own fields may start at FField's data extent (FlagsPrivate+4),
+        // below sizeof(FField): standard layouts pack ArrayDim there, in FField's tail
+        // padding. sdkcoregen::PackBaseTailPadding ends FField's declaration at that
+        // extent; a layout with ArrayDim at sizeof(FField) gets a leading pad instead.
         if (std::string(t.cppName) == "FProperty")
             s.Inherited = static_cast<uint32_t>(offs.FField.FlagsPrivate + sizeof(int32_t));
         s.Size = sizeOf[t.cppName];
@@ -810,11 +826,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 rebuilt.push_back(std::move(m));
                 cursor = static_cast<uint32_t>(f.Offset + f.Size);
             }
-            // FField gets NO explicit trailing pad: it must end at its data extent
-            // (0x34) so the [0x34,sizeof) tail padding stays implicit and reusable
-            // by FProperty (non-POD base, see ~FField below). An explicit Pad member
-            // would fill dsize to 0x38 and kill the reuse → ArrayDim pushed to 0x38.
-            if (cursor < s.Size && s.CppNameOnly != "FField")
+            if (cursor < s.Size)
             {
                 UE_UPackage::Member pad;
                 pad.Type   = "uint8_t";
@@ -843,12 +855,6 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 s.Trailer = fmt::format(
                     "static_assert(sizeof({}) == 0x{:X}, \"{} layout mismatch vs dumped size — re-dump SDK\");",
                     s.CppNameOnly, s.Size, s.CppNameOnly);
-
-            // Non-POD base: a user-provided destructor makes FField non-trivial so
-            // the Itanium ABI permits FProperty to reuse FField's tail padding,
-            // packing ArrayDim @ 0x34 (matches real UE, which is polymorphic here).
-            if (s.CppNameOnly == "FField")
-                s.PrefixDecls = "\t~FField() {}";
 
             if (s.CppNameOnly == "UObject")
             {
@@ -1715,20 +1721,15 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
     // offsets are checkable. Runs before any header is emitted, since it writes the asserts
     // into each struct's Trailer. AIOHeader.hpp is already emitted by this point and stays
     // assert-free — it is a browsing aid, not a compilation entry point.
-    std::vector<UE_UPackage::Struct *> allStructs;
-    for (auto &pkg : _sdkProcessed)
-    {
-        for (auto &s : pkg.Structures) allStructs.push_back(&s);
-        for (auto &c : pkg.Classes)    allStructs.push_back(&c);
-    }
+    const std::vector<UE_UPackage::Struct *> allStructs = CollectStructs(_sdkProcessed);
     const sdkcoregen::CoreTypeSizes coreTypeSizes = sdkcoregen::ObserveCoreTypeSizes(allStructs);
     const sdkcoregen::LayoutGuardStats guardStats =
         sdkcoregen::AppendLayoutGuards(allStructs, _sdkEnumUnderlying);
     logsBufferFmt.append(
         "SDK layout guards: {} structs / {} members checked; {} structs unchecked "
-        "(base tail packing: {}, enum width: {}, propagated: {})\n",
+        "(base overlap: {}, enum width: {}, propagated: {})\n",
         guardStats.CheckedStructs, guardStats.CheckedMembers, guardStats.SkippedStructs(),
-        guardStats.SkippedBaseTailPacking, guardStats.SkippedEnumWidth, guardStats.SkippedPropagated);
+        guardStats.SkippedBaseOverlap, guardStats.SkippedEnumWidth, guardStats.SkippedPropagated);
 
     EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, coreTypeSizes, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
 

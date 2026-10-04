@@ -642,6 +642,214 @@ public:
     return s;
 }
 
+// ── Base tail padding ───────────────────────────────────────────────────────────────
+//
+// Under the Itanium C++ ABI a derived class lays out its own members from the base's data
+// size (dsize, sizeof without tail padding) rather than from its sizeof, provided the base
+// is not POD in the C++03 sense the ABI fixes. Unreal's native types rarely are — a vtable,
+// a constructor or a base class is enough — so the engine routinely puts a derived
+// struct's first members below the base's dumped Size, and GenerateStruct lays them out
+// from there. The base's declaration matches that only when:
+//
+//   * it is not C++03-POD. A struct with a base class never is. A root struct derives from
+//     the empty TTailPaddingReusable<Self> (Basic.h), which leaves it trivial, trivially
+//     copyable and standard-layout. A user-provided destructor would also work, but it
+//     makes the base and every struct built on it non-trivially-copyable, which changes
+//     how they are passed and copied; clang 18+ treats a defaulted one as still POD
+//     outside Apple targets.
+//   * its declared members end at or before the lowest offset any derived struct uses, so
+//     the generated trailing padding is shortened or dropped.
+//   * its sizeof still equals the dumped Size. With the explicit trailing padding gone,
+//     __attribute__((aligned(N))) restores it. Unlike alignas, the attribute may request
+//     less than the natural alignment, which is then kept.
+//
+// A base left with no members is an empty class instead: the empty-base optimization puts
+// derived members at offset 0, which needs no marker and no attribute.
+//
+// Every derived struct's Inherited then becomes the offset its own layout starts at, the
+// base's declared data size, with explicit padding up to its first member. A base whose
+// declaration cannot end early enough — one of its own members, other than padding, lies at
+// or past the offset a derived struct needs, or no alignment yields its Size — is left as it
+// was, so its derived structs keep a member below Inherited and AppendLayoutGuards skips them.
+struct TailPaddingStats
+{
+    size_t ReusedBases = 0;      // bases whose tail padding a derived struct now occupies
+    size_t MarkedRoots = 0;      // of those, root structs given TTailPaddingReusable
+    size_t EmptiedBases = 0;     // of those, root structs reduced to an empty class
+    size_t UnresolvedBases = 0;  // bases whose declaration cannot end early enough
+};
+
+// `structs` must cover every struct in the dump, across all packages, because a base
+// routinely lives in another package than the structs derived from it. Runs before any
+// header is emitted: it rewrites members, Inherited and CppName.
+template <typename StructT>
+TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
+{
+    using detail::hx;
+    using MemberT = typename decltype(StructT::Members)::value_type;
+    constexpr size_t kNone = static_cast<size_t>(-1);
+    constexpr uint32_t kNoMembers = static_cast<uint32_t>(-1);
+    TailPaddingStats stats;
+    const size_t n = structs.size();
+
+    std::unordered_map<std::string, size_t> byName;
+    byName.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i)
+        byName.emplace(structs[i]->CppNameOnly, i);
+
+    std::vector<size_t> base(n, kNone);
+    std::vector<std::vector<size_t>> derived(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        auto it = byName.find(structs[i]->SuperCppName);
+        if (it == byName.end() || it->second == i)
+            continue;
+        base[i] = it->second;
+        derived[it->second].push_back(i);
+    }
+
+    // Deepest first, so every struct is visited after all structs derived from it. The
+    // depth bound keeps a cyclic base chain in a corrupt dump from looping.
+    std::vector<size_t> depth(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t b = base[i]; b != kNone && depth[i] <= n; b = base[b])
+            ++depth[i];
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i)
+        order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return depth[a] > depth[b]; });
+
+    auto isPad = [](const MemberT& m) { return m.Type == "uint8_t" && m.Name.rfind("Pad_0x", 0) == 0; };
+    auto makePad = [](uint32_t offset, uint32_t size)
+    {
+        MemberT pad;
+        pad.Type = "uint8_t";
+        pad.Name = "Pad_" + hx(offset) + "[" + hx(size) + "]";
+        pad.Offset = offset;
+        pad.Size = size;
+        return pad;
+    };
+    auto lowest = [&](const StructT& s)
+    {
+        uint32_t low = kNoMembers;
+        for (const auto& m : s.Members)
+            low = std::min(low, m.Offset);
+        return low;
+    };
+    auto dataEnd = [](const std::vector<MemberT>& members)
+    {
+        uint32_t end = 0;
+        for (const auto& m : members)
+            end = std::max(end, m.Offset + m.Size);
+        return end;
+    };
+
+    // Bottom-up: end each base's declaration at the lowest offset a derived struct starts
+    // at. start[i] is that offset for struct i itself — its lowest member, or, for a struct
+    // without members, the limit it passes on from its own derived structs.
+    std::vector<uint32_t> start(n);
+    std::vector<uint32_t> align(n, 0);
+    std::vector<bool> marked(n, false);
+    for (size_t i : order)
+    {
+        StructT& s = *structs[i];
+        uint32_t limit = s.Size;
+        for (size_t d : derived[i])
+            limit = std::min(limit, start[d]);
+
+        if (limit < s.Size)
+        {
+            std::vector<MemberT> kept;
+            bool fits = true;
+            for (const auto& m : s.Members)
+            {
+                if (m.Offset + m.Size <= limit)
+                    kept.push_back(m);
+                else if (!isPad(m))
+                    fits = false;
+                else if (m.Offset < limit)
+                    kept.push_back(makePad(m.Offset, limit - m.Offset));
+            }
+
+            const bool hasBase = !s.SuperCppName.empty();
+            uint32_t alignment = 0;
+            if (fits && kept.empty())
+            {
+                // An empty class has sizeof 1; one with a base has its base's sizeof.
+                const uint32_t emptySize = !hasBase ? 1 : base[i] != kNone ? structs[base[i]]->Size : s.Inherited;
+                fits = s.Size == emptySize;
+            }
+            else if (fits)
+            {
+                const uint32_t end = dataEnd(kept);
+                for (alignment = 1; alignment <= s.Size; alignment *= 2)
+                    if ((end + alignment - 1) / alignment * alignment == s.Size)
+                        break;
+                fits = alignment <= s.Size;
+            }
+
+            if (fits)
+            {
+                // A struct with a base and no members only passes the limit on to its base.
+                if (!s.Members.empty() || !hasBase)
+                    ++stats.ReusedBases;
+                s.Members = std::move(kept);
+                if (s.Members.empty())
+                    stats.EmptiedBases += !hasBase;
+                else
+                {
+                    align[i] = alignment;
+                    marked[i] = !hasBase;
+                    stats.MarkedRoots += marked[i];
+                }
+            }
+            else
+            {
+                ++stats.UnresolvedBases;
+                limit = s.Size;
+            }
+        }
+        start[i] = s.Members.empty() ? limit : lowest(s);
+    }
+
+    // Top-down: start each derived struct's own layout at its base's declared data size.
+    // dataSize[i] is where a struct derived from struct i starts placing members.
+    std::vector<uint32_t> dataSize(n);
+    for (auto it = order.rbegin(); it != order.rend(); ++it)
+    {
+        const size_t i = *it;
+        StructT& s = *structs[i];
+        const bool hasBase = !s.SuperCppName.empty();
+
+        if (base[i] != kNone && dataSize[base[i]] < s.Inherited)
+        {
+            const uint32_t from = dataSize[base[i]];
+            const uint32_t own = lowest(s);
+            // A member below the base's data stays below Inherited for the guards to report.
+            if (own >= from)
+            {
+                if (own != kNoMembers && own > from)
+                    s.Members.insert(s.Members.begin(), makePad(from, own - from));
+                s.Inherited = from;
+            }
+        }
+
+        if (s.Members.empty())
+            dataSize[i] = hasBase ? s.Inherited : 0;
+        else if (hasBase || marked[i])
+            dataSize[i] = dataEnd(s.Members);
+        else
+            dataSize[i] = s.Size;  // C++03-POD: derived structs start past its sizeof
+
+        const std::string head = "struct ";
+        if (align[i] > 1 && s.CppName.compare(0, head.size(), head) == 0)
+            s.CppName.insert(head.size(), "__attribute__((aligned(" + std::to_string(align[i]) + "))) ");
+        if (marked[i])
+            s.CppName += " : TTailPaddingReusable<" + s.CppNameOnly + ">";
+    }
+    return stats;
+}
+
 // ── Generated-package layout guards ─────────────────────────────────────────────────
 //
 // Every generated member records its dumped offset in a `// 0xNN(0xM)` comment, while
@@ -655,9 +863,11 @@ public:
 // Two dumped conditions make it unable to, and both are properties of a struct rather
 // than of the member being checked, so they propagate to anything built on it:
 //
-//   * A member whose dumped offset lies below the struct's Inherited boundary. The engine
-//     packed it into the base's tail padding; C++ places derived members at or after the
-//     base's size, so the whole struct sits at a fixed skew from its dumped offsets.
+//   * A member whose dumped offset lies below the struct's Inherited boundary.
+//     PackBaseTailPadding lowers Inherited to the base's declared data size wherever the
+//     base's declaration can end before the struct's first member, so a member still below
+//     it lies inside the base's declared data and C++ places the whole struct at a skew
+//     from its dumped offsets.
 //   * A member declared with an enum whose underlying type is wider than the member's
 //     dumped size. The enum's width follows its largest enumerator, which the engine need
 //     not honour when it stores the value in a narrower property.
@@ -671,13 +881,13 @@ struct LayoutGuardStats
 {
     size_t CheckedStructs = 0;
     size_t CheckedMembers = 0;
-    size_t SkippedBaseTailPacking = 0;  // own member inside the base's tail padding
+    size_t SkippedBaseOverlap = 0;      // own member inside the base's declared data
     size_t SkippedEnumWidth = 0;        // own member narrower than its enum
     size_t SkippedPropagated = 0;       // through a base or a struct-valued member
 
     size_t SkippedStructs() const
     {
-        return SkippedBaseTailPacking + SkippedEnumWidth + SkippedPropagated;
+        return SkippedBaseOverlap + SkippedEnumWidth + SkippedPropagated;
     }
 };
 
@@ -821,7 +1031,7 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
     enum class Skip
     {
         None,
-        BaseTailPacking,  // a member of this struct sits inside the base's tail padding
+        BaseOverlap,      // a member of this struct lies inside its base's declared data
         EnumWidth,        // a member of this struct is narrower than its enum
         Base,             // the base cannot be checked
         MemberType,       // a struct-valued member's type cannot be checked
@@ -836,7 +1046,7 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
         {
             if (m.Offset < s.Inherited)
             {
-                skip[i] = Skip::BaseTailPacking;
+                skip[i] = Skip::BaseOverlap;
                 break;
             }
             if (detail::IsBitField(m.Name))
@@ -898,9 +1108,9 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs,
             const char* why = "";
             switch (skip[i])
             {
-            case Skip::BaseTailPacking:
-                ++stats.SkippedBaseTailPacking;
-                why = "a member sits inside the base's tail padding";
+            case Skip::BaseOverlap:
+                ++stats.SkippedBaseOverlap;
+                why = "a member lies inside its base's declared data";
                 break;
             case Skip::EnumWidth:
                 ++stats.SkippedEnumWidth;
