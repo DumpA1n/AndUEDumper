@@ -7,10 +7,13 @@ namespace UEMemory
 
     bool vm_rpm_ptr(const void *address, void *result, size_t len)
     {
-        if (!kPtrValidator.isPtrReadable(address))
-            return false;
+        return address && kMgr.readMem(uintptr_t(address), result, len) == len;
+    }
 
-        return kMgr.readMem(uintptr_t(address), result, len) == len;
+    bool IsPtrReadable(uintptr_t address)
+    {
+        uint8_t value = 0;
+        return vm_rpm_ptr(reinterpret_cast<const void *>(address), &value, sizeof(value));
     }
 
     std::string vm_rpm_str(const void *address, size_t max_len)
@@ -31,7 +34,7 @@ namespace UEMemory
         chars.clear();
         chars.shrink_to_fit();
 
-        if ((int)str[0] == 0 && str.size() == 1)
+        if (str.size() == 1 && (int)str[0] == 0)
             return "";
 
         return str;
@@ -55,7 +58,7 @@ namespace UEMemory
         chars.clear();
         chars.shrink_to_fit();
 
-        if ((int)str[0] == 0 && str.size() == 1)
+        if (str.size() == 1 && (int)str[0] == 0)
             return L"";
 
         return str;

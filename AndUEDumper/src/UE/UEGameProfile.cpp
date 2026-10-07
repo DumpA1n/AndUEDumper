@@ -66,12 +66,12 @@ UEVarsInitStatus IGameProfile::InitUEVars()
     _UEVars.NamesPtr = GetNamesPtr();
     if (IsUsingFNamePool())
     {
-        if (!kPtrValidator.isPtrReadable(_UEVars.NamesPtr))
+        if (!IsPtrReadable(_UEVars.NamesPtr))
             return UEVarsInitStatus::ERROR_INIT_NAMEPOOL;
     }
     else
     {
-        if (!kPtrValidator.isPtrReadable(_UEVars.NamesPtr))
+        if (!IsPtrReadable(_UEVars.NamesPtr))
             return UEVarsInitStatus::ERROR_INIT_GNAMES;
     }
 
@@ -81,7 +81,7 @@ UEVarsInitStatus IGameProfile::InitUEVars()
     };
 
     _UEVars.GUObjectsArrayPtr = GetGUObjectArrayPtr();
-    if (!kPtrValidator.isPtrReadable(_UEVars.GUObjectsArrayPtr))
+    if (!IsPtrReadable(_UEVars.GUObjectsArrayPtr))
         return UEVarsInitStatus::ERROR_INIT_GUOBJECTARRAY;
 
     _UEVars.ObjObjectsPtr = _UEVars.GUObjectsArrayPtr + pOffsets->FUObjectArray.ObjObjects;

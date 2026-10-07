@@ -17,6 +17,10 @@ namespace UEMemory
 
     bool vm_rpm_ptr(const void *address, void *result, size_t len);
 
+    // Asks the memory channel itself, so mappings hidden from /proc/<pid>/maps
+    // still count as readable.
+    bool IsPtrReadable(uintptr_t address);
+
     template <typename T>
     T vm_rpm_ptr(const void *address)
     {
