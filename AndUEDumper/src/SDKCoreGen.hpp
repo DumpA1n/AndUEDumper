@@ -1119,9 +1119,14 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs)
         // A dumped size of 0 is the dumper's placeholder for a struct it could not size;
         // the emitted empty struct is 1 byte, so there is nothing to assert against.
         // The core types synthesized from UE_Offsets already carry their own size assert.
+        // The dumped size is PropertiesSize, which blueprint classes and user structs leave
+        // unrounded; the engine allocates it rounded up to the alignment, as sizeof is.
         if (s.Size > 0 && s.Trailer.find("sizeof(" + s.CppNameOnly + ")") == std::string::npos)
-            guards += "static_assert(sizeof(" + s.CppNameOnly + ") == " + hx(s.Size) + ", \"" +
-                      s.CppNameOnly + " size mismatch vs dumped size — re-dump SDK\");\n";
+        {
+            const std::string align = "alignof(" + s.CppNameOnly + ")";
+            guards += "static_assert(sizeof(" + s.CppNameOnly + ") == (" + hx(s.Size) + " + " + align + " - 1) / " +
+                      align + " * " + align + ", \"" + s.CppNameOnly + " size mismatch vs dumped size — re-dump SDK\");\n";
+        }
 
         for (const auto& m : s.Members)
         {
