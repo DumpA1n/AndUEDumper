@@ -125,8 +125,8 @@ std::string UE_FName::GetName() const
     if (!object) return "None";
 
     uintptr_t nameID_offset = UEWrappers::GetOffsets()->FName.ComparisonIndex;
-    // if (UEWrappers::GetOffsets()->isUsingCasePreservingName)
-    //   nameID_offset = UEWrappers::GetOffsets()->FName.DisplayIndex;
+    if (UEWrappers::GetOffsets()->Config.isUsingCasePreservingName)
+        nameID_offset = UEWrappers::GetOffsets()->FName.DisplayIndex;
 
     int32_t index = 0;
     if (!vm_rpm_ptr(object + nameID_offset, &index, sizeof(int32_t)) || index < 0)
@@ -817,7 +817,11 @@ std::string UE_UByteProperty::GetTypeStr() const
 {
     auto e = GetEnum();
     if (e)
-        return "enum class " + e.GetName();
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return "uint8_t";
 }
 
@@ -963,9 +967,13 @@ UE_UEnum UE_UEnumProperty::GetEnum() const
 
 std::string UE_UEnumProperty::GetTypeStr() const
 {
-    if (GetEnum())
-        return "enum class " + GetEnum().GetName();
-
+    auto e = GetEnum();
+    if (e)
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return GetUnderlayingProperty().GetType().second;
 }
 
@@ -1173,6 +1181,8 @@ UEPropTypeInfo UE_FProperty::GetType() const
         break;
     }
     case HASH("ObjectProperty"):
+    case HASH("ObjectPtrProperty"):
+    case HASH("EncryptedObjectProperty"):
     {
         auto obj = this->Cast<UE_FObjectPropertyBase>();
         type = {UEPropertyType::ObjectProperty, obj.GetTypeStr()};
@@ -1348,29 +1358,9 @@ UEPropTypeInfo UE_FProperty::GetType() const
 
 IFProperty UE_FProperty::GetInterface() const { return IFProperty(this); }
 
-uintptr_t UE_FProperty::FindSubFPropertyBaseOffset() const
-{
-    uintptr_t offset = 0;
-    uintptr_t temp = 0;
-    if (vm_rpm_ptr(object + UEWrappers::GetOffsets()->FProperty.Size, &temp, sizeof(uintptr_t)) && kPtrValidator.isPtrReadable(temp))
-    {
-        offset = UEWrappers::GetOffsets()->FProperty.Size;
-    }
-    else if (vm_rpm_ptr(object + UEWrappers::GetOffsets()->FProperty.Size + sizeof(void *), &temp, sizeof(uintptr_t)) && kPtrValidator.isPtrReadable(temp))
-    {
-        offset = UEWrappers::GetOffsets()->FProperty.Size + sizeof(void *);
-    }
-    return offset;
-}
-
 UE_UStruct UE_FStructProperty::GetStruct() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_UStruct>(object + offset) : UE_UStruct();
+    return vm_rpm_ptr<UE_UStruct>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
 }
 
 std::string UE_FStructProperty::GetTypeStr() const
@@ -1380,12 +1370,7 @@ std::string UE_FStructProperty::GetTypeStr() const
 
 UE_UClass UE_FObjectPropertyBase::GetPropertyClass() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_UClass>(object + offset) : UE_UClass();
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
 }
 
 std::string UE_FObjectPropertyBase::GetTypeStr() const
@@ -1395,12 +1380,7 @@ std::string UE_FObjectPropertyBase::GetTypeStr() const
 
 UE_FProperty UE_FArrayProperty::GetInner() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_FProperty>(object + offset) : UE_FProperty();
+    return vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FArrayProperty.Inner);
 }
 
 std::string UE_FArrayProperty::GetTypeStr() const
@@ -1410,14 +1390,7 @@ std::string UE_FArrayProperty::GetTypeStr() const
 
 UE_UEnum UE_FByteProperty::GetEnum() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    if (offset == 0) return nullptr;
-
-    auto e = vm_rpm_ptr<UE_UEnum>(object + offset);
+    auto e = vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
     return (e && e.IsA<UE_UEnum>()) ? e : nullptr;
 }
 
@@ -1425,28 +1398,32 @@ std::string UE_FByteProperty::GetTypeStr() const
 {
     auto e = GetEnum();
     if (e)
-        return "enum class " + e.GetName();
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return "uint8_t";
 }
 
 uint8_t UE_FBoolProperty::GetFieldSize() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize);
 }
 
 uint8_t UE_FBoolProperty::GetByteOffset() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 1);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 1);
 }
 
 uint8_t UE_FBoolProperty::GetByteMask() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 2);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 2);
 }
 
 uint8_t UE_FBoolProperty::GetFieldMask() const
 {
-    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FProperty.Size + 3);
+    return vm_rpm_ptr<uint8_t>(object + UEWrappers::GetOffsets()->FBoolProperty.FieldSize + 3);
 }
 
 std::string UE_FBoolProperty::GetTypeStr() const
@@ -1460,68 +1437,29 @@ std::string UE_FBoolProperty::GetTypeStr() const
 
 UE_FProperty UE_FEnumProperty::GetUnderlayingProperty() const
 {
-    static uintptr_t off = 0;
-    if (off == 0)
-    {
-        auto p = vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FProperty.Size);
-        if (p && p.GetName() == "UnderlyingType")
-        {
-            off = UEWrappers::GetOffsets()->FProperty.Size;
-        }
-        else
-        {
-            p = vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FProperty.Size - sizeof(void *));
-            if (p && p.GetName() == "UnderlyingType")
-            {
-                off = UEWrappers::GetOffsets()->FProperty.Size + sizeof(void *);
-            }
-        }
-        return off == 0 ? nullptr : p;
-    }
-
-    return vm_rpm_ptr<UE_FProperty>(object + off);
+    return vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FEnumProperty.UnderlyingType);
 }
 
 UE_UEnum UE_FEnumProperty::GetEnum() const
 {
-    static uintptr_t off = 0;
-    if (off == 0)
-    {
-        auto e = vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FProperty.Size + sizeof(void *));
-        if (e && e.IsA<UE_UEnum>())
-        {
-            off = UEWrappers::GetOffsets()->FProperty.Size + sizeof(void *);
-        }
-        else
-        {
-            e = vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FProperty.Size);
-            if (e && e.IsA<UE_UEnum>())
-            {
-                off = UEWrappers::GetOffsets()->FProperty.Size + (sizeof(void *) * 2);
-            }
-        }
-        return off == 0 ? nullptr : e;
-    }
-
-    return vm_rpm_ptr<UE_UEnum>(object + off);
+    return vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FEnumProperty.Enum);
 }
 
 std::string UE_FEnumProperty::GetTypeStr() const
 {
-    if (GetEnum())
-        return "enum class " + GetEnum().GetName();
-
+    auto e = GetEnum();
+    if (e)
+    {
+        auto name = e.GetName();
+        if (!name.empty() && name != "None" && name != "ENone")
+            return name;
+    }
     return GetUnderlayingProperty().GetType().second;
 }
 
 UE_UClass UE_FClassProperty::GetMetaClass() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_UClass>(object + offset + sizeof(void *)) : UE_UClass();
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase + sizeof(void *));
 }
 
 std::string UE_FClassProperty::GetTypeStr() const
@@ -1537,12 +1475,7 @@ std::string UE_FSoftClassProperty::GetTypeStr() const
 
 UE_FProperty UE_FSetProperty::GetElementProp() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_FProperty>(object + offset) : UE_FProperty();
+    return vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FSetProperty.ElementProp);
 }
 
 std::string UE_FSetProperty::GetTypeStr() const
@@ -1552,22 +1485,12 @@ std::string UE_FSetProperty::GetTypeStr() const
 
 UE_FProperty UE_FMapProperty::GetKeyProp() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_FProperty>(object + offset) : UE_FProperty();
+    return vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FMapProperty.KeyProp);
 }
 
 UE_FProperty UE_FMapProperty::GetValueProp() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_FProperty>(object + offset + sizeof(void *)) : UE_FProperty();
+    return vm_rpm_ptr<UE_FProperty>(object + UEWrappers::GetOffsets()->FMapProperty.ValueProp);
 }
 
 std::string UE_FMapProperty::GetTypeStr() const
@@ -1577,12 +1500,7 @@ std::string UE_FMapProperty::GetTypeStr() const
 
 UE_UClass UE_FInterfaceProperty::GetInterfaceClass() const
 {
-    static uintptr_t offset = 0;
-    if (offset == 0)
-    {
-        offset = FindSubFPropertyBaseOffset();
-    }
-    return offset ? vm_rpm_ptr<UE_UClass>(object + offset) : UE_UClass();
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
 }
 
 std::string UE_FInterfaceProperty::GetTypeStr() const

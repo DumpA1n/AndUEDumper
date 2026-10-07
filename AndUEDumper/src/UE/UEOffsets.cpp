@@ -139,6 +139,15 @@ std::string UE_Offsets::ToString() const
             kOUT_NEWLINE();
         }
 
+        kOUT_NS_BEGIN(UClass);
+        {
+            kOUT_NS_MEMBER_P(UClass, CastFlags);
+            kOUT_NS_MEMBER_P(UClass, DefaultObject);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
         kOUT_NS_BEGIN(UFunction);
         {
             kOUT_NS_MEMBER_P(UFunction, EFunctionFlags);
@@ -173,6 +182,19 @@ std::string UE_Offsets::ToString() const
             kOUT_NEWLINE();
         }
 
+        kOUT_NS_BEGIN(FFieldClass);
+        {
+            kOUT_NS_MEMBER_P(FFieldClass, Name);
+            kOUT_NS_MEMBER_P(FFieldClass, Id);
+            kOUT_NS_MEMBER_P(FFieldClass, CastFlags);
+            kOUT_NS_MEMBER_P(FFieldClass, ClassFlags);
+            kOUT_NS_MEMBER_P(FFieldClass, SuperClass);
+            kOUT_NS_MEMBER_P(FFieldClass, Size);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
         kOUT_NS_BEGIN(FProperty);
         {
             kOUT_NS_MEMBER_P(FProperty, ArrayDim);
@@ -180,6 +202,58 @@ std::string UE_Offsets::ToString() const
             kOUT_NS_MEMBER_P(FProperty, PropertyFlags);
             kOUT_NS_MEMBER_P(FProperty, Offset_Internal);
             kOUT_NS_MEMBER_P(FProperty, Size);
+            kOUT_NS_MEMBER_P(FProperty, SubPropertyBase);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FBoolProperty);
+        {
+            kOUT_NS_MEMBER_P(FBoolProperty, FieldSize);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FTextData);
+        {
+            kOUT_NS_MEMBER_P(FTextData, TextSource);
+            kOUT_NS_MEMBER_P(FTextData, GetDisplayString);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FEnumProperty);
+        {
+            kOUT_NS_MEMBER_P(FEnumProperty, UnderlyingType);
+            kOUT_NS_MEMBER_P(FEnumProperty, Enum);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FArrayProperty);
+        {
+            kOUT_NS_MEMBER_P(FArrayProperty, Inner);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FSetProperty);
+        {
+            kOUT_NS_MEMBER_P(FSetProperty, ElementProp);
+            kOUT_NS_END();
+            kOUT_NEWLINE();
+            kOUT_NEWLINE();
+        }
+
+        kOUT_NS_BEGIN(FMapProperty);
+        {
+            kOUT_NS_MEMBER_P(FMapProperty, KeyProp);
+            kOUT_NS_MEMBER_P(FMapProperty, ValueProp);
             kOUT_NS_END();
             kOUT_NEWLINE();
             kOUT_NEWLINE();
@@ -440,12 +514,16 @@ namespace UE_DefaultOffsets
             offsets.UStruct.ChildProperties = offsets.UStruct.Children + sizeof(void *);  // FField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.ChildProperties + sizeof(void *);
 
+            offsets.UClass.CastFlags = 0xD8;
+            offsets.UClass.DefaultObject = 0x138;
+
             offsets.UFunction.EFunctionFlags = offsets.UStruct.PropertiesSize + (sizeof(int32_t) * 2) + ((sizeof(void *) + sizeof(int32_t) * 2) * 2) + (sizeof(void *) * 6);
             offsets.UFunction.NumParams = offsets.UFunction.EFunctionFlags + sizeof(int32_t);
             offsets.UFunction.ParamSize = offsets.UFunction.NumParams + sizeof(int16_t);
             offsets.UFunction.Func = offsets.UFunction.EFunctionFlags + (sizeof(int32_t) * 4) + (sizeof(void *) * 3);
 
             offsets.FField.ClassPrivate = sizeof(void *);
+            offsets.FField.Owner = offsets.FField.ClassPrivate + sizeof(void *);
             offsets.FField.Next = offsets.FField.ClassPrivate + (sizeof(void *) * 3);  // + sizeof(FFieldVariant);
             offsets.FField.NamePrivate = offsets.FField.Next + sizeof(void *);
             offsets.FField.FlagsPrivate = offsets.FField.NamePrivate + offsets.FName.Size;
@@ -455,6 +533,23 @@ namespace UE_DefaultOffsets
             offsets.FProperty.PropertyFlags = GetPtrAlignedOf(offsets.FProperty.ElementSize + sizeof(int32_t));
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
+            offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
+
+            offsets.FFieldClass.Name = 0;
+            offsets.FFieldClass.Id = offsets.FName.Size;
+            offsets.FFieldClass.CastFlags = offsets.FFieldClass.Id + sizeof(uint64_t);
+            offsets.FFieldClass.ClassFlags = offsets.FFieldClass.CastFlags + sizeof(uint64_t);
+            offsets.FFieldClass.SuperClass = GetPtrAlignedOf(offsets.FFieldClass.ClassFlags + sizeof(uint32_t));
+            offsets.FFieldClass.Size = offsets.FFieldClass.SuperClass + sizeof(void *);
+
+            offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
+            offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
+
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
 
             offsets.UProperty.ArrayDim = 0;
             offsets.UProperty.ElementSize = 0;
@@ -532,12 +627,16 @@ namespace UE_DefaultOffsets
             offsets.UStruct.ChildProperties = offsets.UStruct.Children + sizeof(void *);  // FField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.ChildProperties + sizeof(void *);
 
+            offsets.UClass.CastFlags = 0xD8;
+            offsets.UClass.DefaultObject = 0x138;
+
             offsets.UFunction.EFunctionFlags = offsets.UStruct.PropertiesSize + (sizeof(int32_t) * 2) + ((sizeof(void *) + sizeof(int32_t) * 2) * 2) + (sizeof(void *) * 6);
             offsets.UFunction.NumParams = offsets.UFunction.EFunctionFlags + sizeof(int32_t);
             offsets.UFunction.ParamSize = offsets.UFunction.NumParams + sizeof(int16_t);
             offsets.UFunction.Func = offsets.UFunction.EFunctionFlags + (sizeof(int32_t) * 4) + (sizeof(void *) * 3);
 
             offsets.FField.ClassPrivate = sizeof(void *);
+            offsets.FField.Owner = offsets.FField.ClassPrivate + sizeof(void *);
             offsets.FField.Next = offsets.FField.ClassPrivate + sizeof(void *) + GetPtrAlignedOf(sizeof(void *) + sizeof(bool));  // + sizeof(FFieldVariant);
             offsets.FField.NamePrivate = offsets.FField.Next + sizeof(void *);
             offsets.FField.FlagsPrivate = offsets.FField.NamePrivate + offsets.FName.Size;
@@ -547,6 +646,23 @@ namespace UE_DefaultOffsets
             offsets.FProperty.PropertyFlags = GetPtrAlignedOf(offsets.FProperty.ElementSize + sizeof(int32_t));
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
+            offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
+
+            offsets.FFieldClass.Name = 0;
+            offsets.FFieldClass.Id = offsets.FName.Size;
+            offsets.FFieldClass.CastFlags = offsets.FFieldClass.Id + sizeof(uint64_t);
+            offsets.FFieldClass.ClassFlags = offsets.FFieldClass.CastFlags + sizeof(uint64_t);
+            offsets.FFieldClass.SuperClass = GetPtrAlignedOf(offsets.FFieldClass.ClassFlags + sizeof(uint32_t));
+            offsets.FFieldClass.Size = offsets.FFieldClass.SuperClass + sizeof(void *);
+
+            offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
+            offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
+
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
         }
         return offsets;
     }
@@ -568,6 +684,16 @@ namespace UE_DefaultOffsets
             offsets.FProperty.PropertyFlags = GetPtrAlignedOf(offsets.FProperty.ElementSize + sizeof(int32_t));
             offsets.FProperty.Offset_Internal = offsets.FProperty.PropertyFlags + sizeof(int64_t) + sizeof(int32_t);
             offsets.FProperty.Size = GetPtrAlignedOf(offsets.FProperty.Offset_Internal + sizeof(int32_t) + offsets.FName.Size) + (sizeof(void *) * 4);  // sizeof(FProperty)
+            offsets.FProperty.SubPropertyBase = offsets.FProperty.Size;
+            offsets.FBoolProperty.FieldSize = offsets.FProperty.Size;
+
+            offsets.FEnumProperty.UnderlyingType = offsets.FProperty.Size;
+            offsets.FEnumProperty.Enum = offsets.FProperty.Size + sizeof(void *);
+
+            offsets.FArrayProperty.Inner = offsets.FProperty.SubPropertyBase;
+            offsets.FSetProperty.ElementProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.KeyProp = offsets.FProperty.SubPropertyBase;
+            offsets.FMapProperty.ValueProp = offsets.FProperty.SubPropertyBase + sizeof(void *);
         }
         return offsets;
     }

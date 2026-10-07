@@ -18,6 +18,13 @@ struct UE_Offsets
         bool isUsingCasePreservingName = false;
         bool IsUsingFNamePool = false;
         bool isUsingOutlineNumberName = false;
+        // UStruct derives from FStructBaseChain (USTRUCT_FAST_ISCHILDOF_IMPL ==
+        // USTRUCT_ISCHILDOF_STRUCTARRAY): StructBaseChainArray and
+        // NumStructBasesInChainMinusOne occupy the 0x10 bytes before SuperStruct.
+        // Reflection does not expose them, and builds compiled without the struct
+        // array lay that span out differently, so only profiles of builds known to
+        // carry the array set this.
+        bool isUsingStructBaseChain = false;
     } Config;
     struct
     {
@@ -51,7 +58,10 @@ struct UE_Offsets
     struct
     {
         uintptr_t Objects = 0;
+        uintptr_t MaxElements = 0;
         uintptr_t NumElements = 0;
+        uintptr_t MaxChunks = 0;
+        uintptr_t NumChunks = 0;
         uintptr_t NumElementsPerChunk = 0;
     } TUObjectArray;
     struct
@@ -84,6 +94,11 @@ struct UE_Offsets
     } UStruct;
     struct
     {
+        uintptr_t CastFlags = 0;
+        uintptr_t DefaultObject = 0;
+    } UClass;
+    struct
+    {
         uintptr_t EFunctionFlags = 0;
         uintptr_t NumParams = 0;
         uintptr_t ParamSize = 0;
@@ -100,10 +115,22 @@ struct UE_Offsets
     struct
     {
         uintptr_t ClassPrivate = 0;
+        // FFieldVariant; stock layouts place it right after ClassPrivate.
+        uintptr_t Owner = 0;
         uintptr_t Next = 0;
         uintptr_t NamePrivate = 0;
         uintptr_t FlagsPrivate = 0;
     } FField;
+    // FFieldClass, the target of FField::ClassPrivate.
+    struct
+    {
+        uintptr_t Name = 0;
+        uintptr_t Id = 0;
+        uintptr_t CastFlags = 0;
+        uintptr_t ClassFlags = 0;
+        uintptr_t SuperClass = 0;
+        uintptr_t Size = 0;
+    } FFieldClass;
     struct
     {
         uintptr_t ArrayDim = 0;
@@ -111,7 +138,49 @@ struct UE_Offsets
         uintptr_t PropertyFlags = 0;
         uintptr_t Offset_Internal = 0;
         uintptr_t Size = 0;
+        // Offset of the first member FProperty subclasses declare, such as
+        // FObjectPropertyBase::PropertyClass. Stock layouts place it at Size;
+        // some builds insert metadata in between.
+        uintptr_t SubPropertyBase = 0;
     } FProperty;
+    // FBoolProperty declares FieldSize, ByteOffset, ByteMask and FieldMask as
+    // consecutive uint8 members, so FieldSize locates all four. Stock layouts put
+    // FieldSize at FProperty.Size.
+    struct
+    {
+        uintptr_t FieldSize = 0;
+    } FBoolProperty;
+    // FTextImpl::FTextData, the ITextData that FText::TextData points at.
+    // GetDisplayString is the vtable slot of ITextData::GetDisplayString; zero
+    // leaves the emitted FText reading TextSource, the source string that the base
+    // text history embeds (zero keeps the stock 0x28). Implementations keep their
+    // display strings in different members, so only the virtual covers them all.
+    struct
+    {
+        uintptr_t TextSource = 0;
+        uintptr_t GetDisplayString = 0;
+    } FTextData;
+    // The order of UnderlyingType and Enum differs across builds.
+    struct
+    {
+        uintptr_t UnderlyingType = 0;  // pointer to FProperty
+        uintptr_t Enum = 0;            // pointer to UEnum
+    } FEnumProperty;
+    // Container inner properties. Stock layouts place them at SubPropertyBase;
+    // builds that pad individual subclasses move them independently.
+    struct
+    {
+        uintptr_t Inner = 0;  // pointer to FProperty
+    } FArrayProperty;
+    struct
+    {
+        uintptr_t ElementProp = 0;  // pointer to FProperty
+    } FSetProperty;
+    struct
+    {
+        uintptr_t KeyProp = 0;    // pointer to FProperty
+        uintptr_t ValueProp = 0;  // pointer to FProperty
+    } FMapProperty;
 
     std::string ToString() const;
 };
