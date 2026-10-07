@@ -1,5 +1,10 @@
 #include "UPackageGenerator.hpp"
 
+#include <algorithm>
+#include <optional>
+#include <unordered_set>
+
+#include "SDKIdentifiers.hpp"
 #include "UE/UEMemory.hpp"
 using namespace UEMemory;
 
@@ -41,7 +46,176 @@ void UE_UPackage::FillPadding(const UE_UStruct &object, std::vector<Member> &mem
     }
 }
 
-void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
+static std::string SanitizeForCpp(const std::string &in)
+{
+    return SDKIdentifiers::SanitizeType(in);
+}
+
+static std::string SanitizeIdentifier(const std::string &in)
+{
+    return SDKIdentifiers::Sanitize(in);
+}
+
+static std::string SanitizeIdentForCpp(const std::string &in)
+{
+    return SDKIdentifiers::Sanitize(in);
+}
+
+static std::optional<std::string> ReflectedTypeForCpp(const UEPropTypeInfo &type,
+                                                       int32_t size,
+                                                       bool allowOpaquePointer)
+{
+    std::string result = SanitizeForCpp(type.second);
+    const bool sentinel = result == "None" || result == "ENone";
+    if (type.first != UEPropertyType::Unknown && !sentinel
+        && SDKIdentifiers::IsUsableType(result))
+        return result;
+    if (allowOpaquePointer && size == static_cast<int32_t>(sizeof(void *))
+        && result.find('*') != std::string::npos)
+        return std::string{"void*"};
+    return std::nullopt;
+}
+
+// builtins/preamble idents — never count as package deps
+static const std::unordered_set<std::string> &kBuiltinIdents()
+{
+    static const std::unordered_set<std::string> s = {
+        // C++ primitives / qualifiers
+        "void", "bool", "char", "short", "int", "long", "float", "double",
+        "signed", "unsigned",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "size_t", "ptrdiff_t", "intptr_t", "uintptr_t",
+        // C++ keywords that may appear via "struct"/"enum class"/"const" prefixes
+        "struct", "enum", "class", "const", "volatile",
+        // Basic UE types provided by the AIOHeader preamble
+        "FName", "FString", "FText",
+        "FScriptDelegate", "FDelegate", "FMulticastDelegate",
+        "FMulticastInlineDelegate", "FMulticastSparseDelegate",
+        "FWeakObjectPtr", "FUniqueObjectGuid",
+        "FField", "FFieldClass", "FFieldVariant", "FProperty",
+        "FScriptInterface", "FFieldPath",
+        // Predefined container / wrapper templates
+        "TArray", "TMap", "TSet", "TPair",
+        "TWeakObjectPtr", "TLazyObjectPtr",
+        "TSoftObjectPtr", "TSoftClassPtr",
+        "TSubclassOf", "TScriptInterface", "TFieldPath",
+        // sentinel for unknown children; fwd-declared in preamble
+        "None", "FNone",
+    };
+    return s;
+}
+
+// WrapperKind: PtrHandle (stores T*, fwd-decl OK) vs ValueHolding (needs complete T)
+enum class WrapperKind { PtrHandle, ValueHolding };
+
+static bool ClassifyWrapper(const std::string &ident, WrapperKind *out)
+{
+    static const std::unordered_set<std::string> kPtr = {
+        "TArray",
+        "TWeakObjectPtr", "TLazyObjectPtr",
+        "TSoftObjectPtr", "TSoftClassPtr",
+        "TSubclassOf", "TScriptInterface", "TFieldPath",
+    };
+    static const std::unordered_set<std::string> kValue = {
+        "TPair", "TSet", "TMap",
+    };
+    if (kPtr.count(ident))   { *out = WrapperKind::PtrHandle;    return true; }
+    if (kValue.count(ident)) { *out = WrapperKind::ValueHolding; return true; }
+    return false;
+}
+
+void UE_UPackage::ExtractTypeDeps(const std::string &typeStr,
+                                  std::set<std::string> &fullDeps,
+                                  std::set<std::string> &fwdDeps)
+{
+    const auto &builtins = kBuiltinIdents();
+
+    // stack of wrapper kinds; full-dep if any enclosing wrapper is value-holding.
+    // T* always fwd-only. Unknown templates fall back to ValueHolding.
+    std::vector<WrapperKind> wstack;
+    bool                     pendingHasKind = false;
+    WrapperKind              pendingKind    = WrapperKind::ValueHolding;
+
+    size_t i = 0;
+    const size_t n = typeStr.size();
+
+    while (i < n)
+    {
+        char c = typeStr[i];
+
+        if (c == '<')
+        {
+            wstack.push_back(pendingHasKind ? pendingKind : WrapperKind::ValueHolding);
+            pendingHasKind = false;
+            i++; continue;
+        }
+        if (c == '>')
+        {
+            if (!wstack.empty()) wstack.pop_back();
+            pendingHasKind = false;
+            i++; continue;
+        }
+
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
+        {
+            size_t start = i;
+            while (i < n && (std::isalnum(static_cast<unsigned char>(typeStr[i])) || typeStr[i] == '_'))
+                i++;
+            std::string ident = typeStr.substr(start, i - start);
+
+            // consume trailing ws so 'TMap <K, V>' still parses
+            while (i < n && std::isspace(static_cast<unsigned char>(typeStr[i])))
+                i++;
+
+            const bool isPointer    = (i < n && typeStr[i] == '*');
+            const bool followedByLT = (i < n && typeStr[i] == '<');
+
+            if (builtins.count(ident))
+            {
+                WrapperKind k;
+                if (followedByLT && ClassifyWrapper(ident, &k))
+                {
+                    pendingKind    = k;
+                    pendingHasKind = true;
+                }
+                else
+                {
+                    pendingHasKind = false;
+                }
+                continue;
+            }
+
+            if (wstack.empty())
+            {
+                if (isPointer) fwdDeps.insert(std::move(ident));
+                else           fullDeps.insert(std::move(ident));
+            }
+            else if (isPointer)
+            {
+                fwdDeps.insert(std::move(ident));
+            }
+            else
+            {
+                bool anyValue = false;
+                for (WrapperKind w : wstack)
+                {
+                    if (w == WrapperKind::ValueHolding) { anyValue = true; break; }
+                }
+                if (anyValue) fullDeps.insert(std::move(ident));
+                else          fwdDeps.insert(std::move(ident));
+            }
+            pendingHasKind = false;
+        }
+        else
+        {
+            pendingHasKind = false;
+            i++;
+        }
+    }
+}
+
+bool UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
 {
     out->Name = fn.GetName();
     out->FullName = fn.GetFullName();
@@ -50,6 +224,12 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
     out->NumParams = fn.GetNumParams();
     out->ParamSize = fn.GetParamSize();
     out->Func = fn.GetFunc();
+    out->IsStatic = (out->EFlags & FUNC_Static) != 0;
+    out->ReturnType = "void"; // overwritten if a CPF_ReturnParm is found
+
+    out->CppNameOnly = SanitizeIdentForCpp(fn.GetName());
+    std::unordered_set<std::string> parameterNames;
+    bool usable = true;
 
     auto generateParam = [&](IProperty *prop)
     {
@@ -58,24 +238,52 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         // if property has 'ReturnParm' flag
         if (flags & CPF_ReturnParm)
         {
-            out->CppName = prop->GetType().second + " " + fn.GetName();
+            auto type = ReflectedTypeForCpp(prop->GetType(), prop->GetSize(), true);
+            if (!type)
+            {
+                usable = false;
+                return;
+            }
+            out->ReturnType = std::move(*type);
         }
         // if property has 'Parm' flag
         else if (flags & CPF_Parm)
         {
-            if (prop->GetArrayDim() > 1)
+            auto type = ReflectedTypeForCpp(prop->GetType(), prop->GetSize(), true);
+            if (!type)
             {
-                out->Params += fmt::format("{}* {}, ", prop->GetType().second, prop->GetName());
+                usable = false;
+                return;
+            }
+            const std::string typeStr = std::move(*type);
+            const std::string nameStr = SDKIdentifiers::MakeUnique(
+                SanitizeIdentForCpp(prop->GetName()), parameterNames);
+            const int32_t arrDim = prop->GetArrayDim();
+
+            Param p;
+            p.Type = typeStr;
+            p.Name = nameStr;
+            p.Flags = flags;
+            p.ArrayDim = arrDim;
+            out->ParamsList.push_back(std::move(p));
+
+            if (arrDim > 1)
+            {
+                out->Params += fmt::format("{}* {}, ", typeStr, nameStr);
             }
             else
             {
-                if (flags & CPF_OutParm)
+                if ((flags & CPF_OutParm) && !(flags & CPF_ConstParm))
                 {
-                    out->Params += fmt::format("{}& {}, ", prop->GetType().second, prop->GetName());
+                    out->Params += fmt::format("{}& {}, ", typeStr, nameStr);
+                }
+                else if ((flags & CPF_OutParm) && (flags & CPF_ConstParm))
+                {
+                    out->Params += fmt::format("const {}& {}, ", typeStr, nameStr);
                 }
                 else
                 {
-                    out->Params += fmt::format("{} {}, ", prop->GetType().second, prop->GetName());
+                    out->Params += fmt::format("{} {}, ", typeStr, nameStr);
                 }
             }
         }
@@ -91,15 +299,21 @@ void UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
         auto propInterface = prop.GetInterface();
         generateParam(&propInterface);
     }
+    if (!usable)
+        return false;
     if (out->Params.size())
     {
         out->Params.erase(out->Params.size() - 2);
     }
 
-    if (out->CppName.size() == 0)
-    {
-        out->CppName = "void " + fn.GetName();
-    }
+    // CppName = '[static ]<ReturnType> <FuncName>' (Params appended later)
+    out->CppName.clear();
+    if (out->IsStatic)
+        out->CppName += "static ";
+    out->CppName += out->ReturnType;
+    out->CppName += ' ';
+    out->CppName += out->CppNameOnly;
+    return true;
 }
 
 void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &arr)
@@ -108,8 +322,9 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     s.Name = object.GetName();
     s.FullName = object.GetFullName();
 
+    s.CppNameOnly = SanitizeIdentifier(object.GetCppName());
     s.CppName = "struct ";
-    s.CppName += object.GetCppName();
+    s.CppName += s.CppNameOnly;
 
     s.Inherited = 0;
     s.Size = object.GetSize();
@@ -123,27 +338,66 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     auto super = object.GetSuper();
     if (super)
     {
+        s.SuperCppName = SanitizeIdentifier(super.GetCppName());
         s.CppName += " : ";
-        s.CppName += super.GetCppName();
+        s.CppName += s.SuperCppName;
         s.Inherited = super.GetSize();
+        // Inheriting requires the complete super type
+        s.FullDeps.insert(s.SuperCppName);
     }
 
+    // The engine places a derived struct's first members in its base's tail padding
+    // whenever the base's native type permits it, so an own member can sit below the
+    // base's size. Laying out from the lowest own offset keeps every member at its dumped
+    // offset; sdkcoregen::PackBaseTailPadding then ends the base's declaration before it.
     uint32_t offset = s.Inherited;
+    auto lowerToOwnMember = [&](IProperty *prop)
+    {
+        if (prop->GetSize() * prop->GetArrayDim() > 0)
+            offset = std::min(offset, static_cast<uint32_t>(prop->GetOffset()));
+    };
+    for (auto prop = object.GetChildProperties().Cast<UE_FProperty>(); prop; prop = prop.GetNext().Cast<UE_FProperty>())
+    {
+        auto propInterface = prop.GetInterface();
+        lowerToOwnMember(&propInterface);
+    }
+    for (auto child = object.GetChildren(); child; child = child.GetNext())
+    {
+        if (!child.IsA<UE_UProperty>())
+            continue;
+        auto propInterface = child.Cast<UE_UProperty>().GetInterface();
+        lowerToOwnMember(&propInterface);
+    }
     uint8_t bitOffset = 0;
+    std::unordered_set<std::string> scopeIdentifiers;
 
-    auto generateMember = [&](IProperty *prop, Member *m)
+    auto generateMember = [&](IProperty *prop, Member *m) -> bool
     {
         auto arrDim = prop->GetArrayDim();
         m->Size = prop->GetSize() * arrDim;
         if (m->Size == 0)
         {
-            return;
+            return false;
         }  // this shouldn't be zero
 
         auto type = prop->GetType();
-        m->Type = type.second;
-        m->Name = prop->GetName();
+        auto reflectedType = ReflectedTypeForCpp(type, prop->GetSize(), false);
+        m->Name = SDKIdentifiers::MakeUnique(
+            SanitizeIdentForCpp(prop->GetName()), scopeIdentifiers);
         m->Offset = prop->GetOffset();
+
+        const bool opaque = !reflectedType;
+        if (opaque)
+        {
+            m->Type = "uint8_t";
+            if (m->Size > 1)
+                m->Name += fmt::format("[0x{:X}]", m->Size);
+        }
+        else
+            m->Type = std::move(*reflectedType);
+
+        // Track which other dumped types this member references
+        ExtractTypeDeps(m->Type, s.FullDeps, s.ForwardDeps);
 
         if (m->Offset > offset)
         {
@@ -164,39 +418,49 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
                 mask >>= 1;
                 ones++;
             }
-            if (zeros > bitOffset)
+            if (ones == 0)
             {
-                UE_UPackage::GenerateBitPadding(s.Members, offset, bitOffset, zeros - bitOffset);
-                bitOffset = zeros;
+                // mask was zero; C++ rejects 0-width bit-field, use full byte
+                offset += m->Size;
+                m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
             }
-            m->Name += fmt::format(" : {}", ones);
-            bitOffset += ones;
-
-            if (bitOffset == 8)
+            else
             {
-                offset++;
-                bitOffset = 0;
-            }
+                if (zeros > bitOffset)
+                {
+                    UE_UPackage::GenerateBitPadding(s.Members, offset, bitOffset, zeros - bitOffset);
+                    bitOffset = zeros;
+                }
+                m->Name += fmt::format(" : {}", ones);
+                bitOffset += ones;
 
-            m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
+                if (bitOffset == 8)
+                {
+                    offset++;
+                    bitOffset = 0;
+                }
+
+                m->extra = fmt::format("Mask(0x{:X})", boolProp->GetFieldMask());
+            }
         }
         else
         {
-            if (arrDim > 1)
+            if (!opaque && arrDim > 1)
             {
                 m->Name += fmt::format("[0x{:X}]", arrDim);
             }
 
             offset += m->Size;
         }
+        return true;
     };
 
     for (auto prop = object.GetChildProperties().Cast<UE_FProperty>(); prop; prop = prop.GetNext().Cast<UE_FProperty>())
     {
         Member m;
         auto propInterface = prop.GetInterface();
-        generateMember(&propInterface, &m);
-        s.Members.push_back(m);
+        if (generateMember(&propInterface, &m))
+            s.Members.push_back(std::move(m));
     }
 
     for (auto child = object.GetChildren(); child; child = child.GetNext())
@@ -205,7 +469,20 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         {
             auto fn = child.Cast<UE_UFunction>();
             Function f;
-            GenerateFunction(fn, &f);
+            if (!GenerateFunction(fn, &f))
+                continue;
+            f.CppNameOnly = SDKIdentifiers::MakeUnique(f.CppNameOnly, scopeIdentifiers);
+            f.CppName.clear();
+            if (f.IsStatic)
+                f.CppName += "static ";
+            f.CppName += f.ReturnType;
+            f.CppName += ' ';
+            f.CppName += f.CppNameOnly;
+            f.OwnerCppName = s.CppNameOnly;
+            f.OwnerUEName = s.Name;
+            // fn signatures only need fwd-decls (bodies live in .cpp)
+            ExtractTypeDeps(f.CppName, s.ForwardDeps, s.ForwardDeps);
+            ExtractTypeDeps(f.Params, s.ForwardDeps, s.ForwardDeps);
             s.Functions.push_back(f);
         }
         else if (child.IsA<UE_UProperty>())
@@ -213,8 +490,8 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
             auto prop = child.Cast<UE_UProperty>();
             Member m;
             auto propInterface = prop.GetInterface();
-            generateMember(&propInterface, &m);
-            s.Members.push_back(m);
+            if (generateMember(&propInterface, &m))
+                s.Members.push_back(std::move(m));
         }
     }
 
@@ -222,6 +499,11 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     {
         UE_UPackage::FillPadding(object, s.Members, offset, bitOffset, s.Size);
     }
+
+    // Self-references in templated members (e.g., TArray<FFoo>) must not
+    // make the struct depend on itself.
+    s.FullDeps.erase(s.CppNameOnly);
+    s.ForwardDeps.erase(s.CppNameOnly);
 
     arr.push_back(s);
 }
@@ -235,8 +517,8 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
     uint64_t pairSize = nameSize + sizeof(int64_t);
 
     auto names = object.GetNames();
-    uint64_t max = 0;
 
+    std::unordered_set<std::string> seenEnumNames;
     for (int32_t i = 0; i < names.Num(); i++)
     {
         auto pair = names.GetData() + i * pairSize;
@@ -247,10 +529,13 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
             str = str.substr(pos + 1);
 
         auto value = vm_rpm_ptr<uint64_t>(pair + nameSize);
-        if (value > max)
-            max = value;
 
-        e.Members.emplace_back(str, value);
+        std::string sanitized = SanitizeIdentForCpp(str);
+        // drop duplicate enumerator names (C++ rejects redefinition)
+        if (!seenEnumNames.insert(sanitized).second)
+            continue;
+
+        e.Members.emplace_back(std::move(sanitized), value);
     }
 
     // enum values should be in ascending order
@@ -269,25 +554,41 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
 
     if (isUninitializedEnum(e))
     {
-        max = e.Members.size();
         for (size_t i = 0; i < e.Members.size(); ++i)
         {
             e.Members[i].second = i;
         }
     }
 
-    const char *type = nullptr;
+    // UEnum::SetEnums appends a generated <Prefix>_MAX key one past the largest value. The
+    // engine's C++ enum never declares it, so it does not bound the underlying type: an
+    // enum whose values end at 255 is a uint8 enum even though its _MAX is 256. The key is
+    // kept only where the chosen type can represent it.
+    const bool generatedMax = !e.Members.empty() && e.Members.back().first.ends_with("_MAX");
+    const size_t valueCount = e.Members.size() - (generatedMax ? 1 : 0);
+    uint64_t max = 0;
+    for (size_t i = 0; i < valueCount; ++i)
+    {
+        if (e.Members[i].second > max)
+            max = e.Members[i].second;
+    }
 
-    if (max > GetMaxOfType<uint32_t>())
-        type = " : uint64_t";
-    else if (max > GetMaxOfType<uint16_t>())
-        type = " : uint32_t";
-    else if (max > GetMaxOfType<uint8_t>())
-        type = " : uint16_t";
-    else
-        type = " : uint8_t";
+    struct Width { const char *type; uint64_t max; };
+    static constexpr Width kWidths[] = {
+        {"uint8_t", GetMaxOfType<uint8_t>()},
+        {"uint16_t", GetMaxOfType<uint16_t>()},
+        {"uint32_t", GetMaxOfType<uint32_t>()},
+        {"uint64_t", UINT64_MAX},
+    };
+    const Width *width = kWidths;
+    while (max > width->max)
+        ++width;
+    e.UnderlyingType = width->type;
+    if (generatedMax && e.Members.back().second > width->max)
+        e.Members.pop_back();
 
-    e.CppName = "enum class " + object.GetName() + type;
+    e.CppNameOnly = SanitizeIdentifier(object.GetName());
+    e.CppName = "enum class " + e.CppNameOnly + " : " + e.UnderlyingType;
 
     if (e.Members.size())
     {
@@ -297,39 +598,87 @@ void UE_UPackage::GenerateEnum(const UE_UEnum &object, std::vector<Enum> &arr)
 
 void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBufFmt)
 {
+    auto trimNl = [](std::string s) {
+        while (!s.empty() && s.back() == '\n') s.pop_back();
+        return s;
+    };
+
     for (auto &s : arr)
     {
         pBufFmt->append("// Object: {}\n// Size: 0x{:X} (Inherited: 0x{:X})\n{}\n{{",
                         s.FullName, s.Size, s.Inherited, s.CppName);
 
+        // emit segments with single blank between, regardless of which exist
+        std::vector<std::string> segs;
+
+        if (!s.PrefixDecls.empty())
+            segs.push_back(trimNl(s.PrefixDecls));
+
         if (s.Members.size())
         {
+            std::string seg;
             for (auto &m : s.Members)
             {
-                pBufFmt->append("\n\t{} {}; // 0x{:X}(0x{:X})", m.Type, m.Name, m.Offset, m.Size);
+                if (!seg.empty()) seg += "\n";
+                seg += fmt::format("\t{} {}; // 0x{:X}(0x{:X})", m.Type, m.Name, m.Offset, m.Size);
                 if (!m.extra.empty())
-                {
-                    pBufFmt->append(", {}", m.extra);
-                }
+                    seg += fmt::format(", {}", m.extra);
             }
+            segs.push_back(std::move(seg));
         }
+
         if (s.Functions.size())
         {
-            if (s.Members.size())
-                pBufFmt->append("\n");
-
+            std::string seg;
             for (auto &f : s.Functions)
             {
+                if (!seg.empty()) seg += "\n\n";
                 void *funcOffset = f.Func ? (void *)(f.Func - UEWrappers::GetUEVars()->GetBaseAddress()) : nullptr;
-                pBufFmt->append("\n\n\t// Object: {}\n\t// Flags: [{}]\n\t// Offset: {}\n\t// Params: [ Num({}) Size(0x{:X}) ]\n\t{}({});", f.FullName, f.Flags, funcOffset, f.NumParams, f.ParamSize, f.CppName, f.Params);
+                seg += fmt::format("\t// Object: {}\n\t// Flags: [{}]\n\t// Offset: {}\n\t// Params: [ Num({}) Size(0x{:X}) ]\n\t{}({});",
+                                   f.FullName, f.Flags, funcOffset, f.NumParams, f.ParamSize, f.CppName, f.Params);
             }
+            segs.push_back(std::move(seg));
         }
-        pBufFmt->append("\n}};\n\n");
+
+        if (!s.ExtraDecls.empty())
+            segs.push_back(trimNl(s.ExtraDecls));
+
+        for (size_t i = 0; i < segs.size(); ++i)
+        {
+            pBufFmt->append("\n{}", segs[i]);
+            if (i + 1 < segs.size())
+                pBufFmt->append("\n");
+        }
+
+        pBufFmt->append("\n}};\n");
+        if (!s.Trailer.empty())
+            pBufFmt->append("{}\n", s.Trailer);
+        pBufFmt->append("\n");
     }
+}
+
+// Enumerator names that collide with system-header macros. Rename
+// collisions to <EnumName>_<OriginalName> so the preprocessor doesn't
+// rewrite them. Add new entries as they show up.
+static const std::unordered_set<std::string> &kSystemMacroConflicts()
+{
+    static const std::unordered_set<std::string> s = {
+        "EM_MAX", // <bits/elf_common.h>: #define EM_MAX 102
+    };
+    return s;
 }
 
 void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt)
 {
+    const auto &conflicts = kSystemMacroConflicts();
+
+    auto qualify = [&](const std::string &enumName, const std::string &enumeratorName) -> std::string
+    {
+        if (conflicts.count(enumeratorName))
+            return enumName + "_" + enumeratorName;
+        return enumeratorName;
+    };
+
     for (auto &e : arr)
     {
         pBufFmt->append("// Object: {}\n{}\n{{", e.FullName, e.CppName);
@@ -338,11 +687,11 @@ void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt
         for (size_t i = 0; i < lastIdx; i++)
         {
             auto &m = e.Members.at(i);
-            pBufFmt->append("\n\t{} = {},", m.first, m.second);
+            pBufFmt->append("\n\t{} = {},", qualify(e.CppNameOnly, m.first), m.second);
         }
 
         auto &m = e.Members.at(lastIdx);
-        pBufFmt->append("\n\t{} = {}", m.first, m.second);
+        pBufFmt->append("\n\t{} = {}", qualify(e.CppNameOnly, m.first), m.second);
 
         pBufFmt->append("\n}};\n\n");
     }
@@ -350,6 +699,7 @@ void UE_UPackage::AppendEnumsToBuffer(std::vector<Enum> &arr, BufferFmt *pBufFmt
 
 void UE_UPackage::Process()
 {
+    PackageName = GetObject().GetName();
     auto &objects = Package->second;
     for (auto &object : objects)
     {

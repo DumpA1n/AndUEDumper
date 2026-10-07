@@ -14,6 +14,8 @@
 using ProgressCallback = std::function<void(const SimpleProgressBar &)>;
 using UEPackagesArray = std::vector<std::pair<uint8_t *const, std::vector<UE_UObject>>>;
 
+#include "UPackageGenerator.hpp"
+
 class UEDumper
 {
     IGameProfile const *_profile;
@@ -24,6 +26,17 @@ class UEDumper
     std::function<void(bool)> _dumpOffsetsInfoNotify;
     ProgressCallback _objectsProgressCallback;
     ProgressCallback _dumpProgressCallback;
+
+    // ProcessEvent vtable index found by DumpOffsetsInfo, baked into emitted SDK.
+    int _processEventIndex = 0;
+
+    // cached output of BuildProcessedPackages (cleared per Dump())
+    std::vector<UE_UPackage> _sdkProcessed;
+    std::unordered_map<std::string, size_t> _sdkNameToPkg;
+    // name -> underlying type, for cross-pkg enum forward decls
+    std::unordered_map<std::string, std::string> _sdkEnumUnderlying;
+    std::vector<size_t> _sdkPkgOrder;
+    std::string _sdkPackagesUnsaved;
 
 public:
     UEDumper() : _profile(nullptr), _dumpExeInfoNotify(nullptr), _dumpNamesInfoNotify(nullptr), _dumpObjectsInfoNotify(nullptr), _objectsProgressCallback(nullptr), _dumpProgressCallback(nullptr) {}
@@ -55,5 +68,17 @@ private:
 
     void GatherUObjects(BufferFmt &logsBufferFmt, BufferFmt &objsBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback);
 
-    void DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback);
+    void BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback);
+
+    // Inject empty Struct entries for non-UObject reflection metadata types
+    // (FField / FFieldClass / FProperty + 13 FProperty subclasses) into CoreUObject
+    // package. Members stay empty here; augment() fills them via fieldsFor().
+    // Runs after dropDups but before augment.
+    void SynthesizeReflectionTypes();
+
+    void DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt);
+
+    // Per-package SDK/<pkg>.hpp + SDK/SDK.hpp aggregator.
+    void DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap);
+
 };

@@ -2,6 +2,11 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
@@ -9,6 +14,10 @@ using json = nlohmann::json;
 using namespace UEMemory;
 
 #include "UPackageGenerator.hpp"
+#include "SDKMathNames.hpp"
+#include "UECoreEmbed.hpp"
+#include "UtfcppEmbed.hpp"
+#include "SDKCoreGen.hpp"
 
 #define kVECTOR_CONTAINS(vec, val) (std::find(vec.begin(), vec.end(), val) != vec.end())
 
@@ -39,6 +48,19 @@ namespace dumper_jf_ns
         j = json{{"Name", fname}, {"Address", (jf.Address - base_address)}};
     }
 }  // namespace dumper_jf_ns
+
+// Every struct and class of every package, for the passes that need a struct's base and
+// member types, which routinely live in other packages.
+static std::vector<UE_UPackage::Struct *> CollectStructs(std::vector<UE_UPackage> &packages)
+{
+    std::vector<UE_UPackage::Struct *> all;
+    for (auto &pkg : packages)
+    {
+        for (auto &s : pkg.Structures) all.push_back(&s);
+        for (auto &c : pkg.Classes)    all.push_back(&c);
+    }
+    return all;
+}
 
 bool UEDumper::Init(IGameProfile *profile)
 {
@@ -96,9 +118,20 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
         return false;
     }
 
+    BuildProcessedPackages(packages, _dumpProgressCallback);
+
+    // Rewrites declarations, so it precedes every header, AIOHeader.hpp included.
+    const sdkcoregen::TailPaddingStats tailStats =
+        sdkcoregen::PackBaseTailPadding(CollectStructs(_sdkProcessed));
+    logsBufferFmt.append(
+        "SDK base tail padding: {} bases reused ({} roots marked, {} emptied); {} unresolved\n",
+        tailStats.ReusedBases, tailStats.MarkedRoots, tailStats.EmptiedBases, tailStats.UnresolvedBases);
+
     outBuffersMap->insert({"AIOHeader.hpp", BufferFmt()});
     BufferFmt &aioBufferFmt = outBuffersMap->at("AIOHeader.hpp");
-    DumpAIOHeader(logsBufferFmt, aioBufferFmt, packages, _dumpProgressCallback);
+    DumpAIOHeader(logsBufferFmt, aioBufferFmt);
+
+    DumpSDK_PerPackage(logsBufferFmt, *outBuffersMap);
 
     dumper_jf_ns::base_address = _profile->GetUnrealELF().base();
     if (dumper_jf_ns::jsonFunctions.size())
@@ -259,6 +292,8 @@ void UEDumper::DumpOffsetsInfo(BufferFmt &logsBufferFmt, BufferFmt &offsetsBuffe
     uEPointers.ProcessEvent = ProcessEventPtr ? (ProcessEventPtr - baseAddr) : 0;
     uEPointers.ProcessEventIndex = ProcessEventIndex;
 
+    _processEventIndex = ProcessEventIndex;
+
     offsetsBufferFmt.append("#pragma once\n\n#include <cstdint>\n\n\n");
     offsetsBufferFmt.append("{}\n\n{}", _profile->GetOffsets()->ToString(), uEPointers.ToString());
 
@@ -324,18 +359,238 @@ void UEDumper::GatherUObjects(BufferFmt &logsBufferFmt, BufferFmt &objsBufferFmt
     logsBufferFmt.append("==========================\n");
 }
 
-void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback)
+
+// Topological sort (DFS); cycle nodes emit in DFS-encounter order.
+template <typename Node, typename DepsFn>
+static std::vector<Node> TopoSort(const std::vector<Node> &nodes, DepsFn getDeps)
 {
-    int packages_saved = 0;
-    std::string packages_unsaved{};
+    enum class State : uint8_t { Unvisited, Visiting, Visited };
+    std::unordered_map<Node, State> state;
+    state.reserve(nodes.size());
+    for (const auto &n : nodes) state.emplace(n, State::Unvisited);
 
-    int classes_saved = 0;
-    int structs_saved = 0;
-    int enums_saved = 0;
+    std::vector<Node> out;
+    out.reserve(nodes.size());
 
-    static bool processInternal_once = false;
+    std::function<void(const Node &)> dfs = [&](const Node &n)
+    {
+        auto it = state.find(n);
+        if (it == state.end()) return;            // not in our universe
+        if (it->second != State::Unvisited) return; // visited or in progress (cycle)
+        it->second = State::Visiting;
+        for (const auto &dep : getDeps(n))
+        {
+            dfs(dep);
+        }
+        it->second = State::Visited;
+        out.push_back(n);
+    };
 
-    aioBufferFmt.append("#pragma once\n\n#include <cstdio>\n#include <string>\n#include <cstdint>\n\n\n");
+    for (const auto &n : nodes) dfs(n);
+    return out;
+}
+
+void UEDumper::SynthesizeReflectionTypes()
+{
+    // Find CoreUObject package; refuse to synthesize anywhere else.
+    UE_UPackage *corePkg = nullptr;
+    for (auto &p : _sdkProcessed)
+    {
+        if (p.PackageName == "CoreUObject")
+        {
+            corePkg = &p;
+            break;
+        }
+    }
+    if (!corePkg) return;
+
+    const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
+
+    // FField / FProperty layout only exists from UE 4.25+. If the profile
+    // didn't initialize FProperty.Size, this build has no FField at all.
+    if (offs.FProperty.Size == 0) return;
+
+    // Size table — needs to mirror §4.3 of docs/architecture/reflection-emit.md.
+    // Computed in topological order so child sizes can refer to parent sizes.
+    std::unordered_map<std::string, uint32_t> sizeOf;
+    auto align8 = [](uintptr_t v) -> uint32_t {
+        return static_cast<uint32_t>((v + 7) & ~uintptr_t(7));
+    };
+    sizeOf["FFieldClass"]         = static_cast<uint32_t>(offs.FFieldClass.Size);
+    sizeOf["FField"]              = align8(offs.FField.FlagsPrivate + sizeof(int32_t));
+    sizeOf["FProperty"]           = static_cast<uint32_t>(offs.FProperty.Size);
+    sizeOf["FStructProperty"]     = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FObjectPropertyBase"] = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FClassProperty"]      = sizeOf["FObjectPropertyBase"] + sizeof(void *);
+    sizeOf["FSoftClassProperty"]  = sizeOf["FClassProperty"];
+    sizeOf["FArrayProperty"]      = static_cast<uint32_t>(offs.FArrayProperty.Inner + sizeof(void *));
+    sizeOf["FByteProperty"]       = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FBoolProperty"]       = align8(offs.FBoolProperty.FieldSize + 4);
+    sizeOf["FEnumProperty"]       = static_cast<uint32_t>(
+        std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum) + sizeof(void *));
+    sizeOf["FSetProperty"]        = static_cast<uint32_t>(offs.FSetProperty.ElementProp + sizeof(void *));
+    sizeOf["FMapProperty"]        = static_cast<uint32_t>(offs.FMapProperty.ValueProp + sizeof(void *));
+    sizeOf["FInterfaceProperty"]  = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FFieldPathProperty"]  = static_cast<uint32_t>(offs.FProperty.Size + offs.FName.Size);
+    sizeOf["FDelegateProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    sizeOf["FOptionalProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+
+    struct ReflectionType { const char *cppName; const char *parent; };
+    static constexpr ReflectionType kReflectionTypes[] = {
+        // FField hierarchy
+        { "FFieldClass",         "" },
+        { "FField",              "" },
+        // FProperty : FField. FProperty's Inherited is FField's data extent; see below.
+        { "FProperty",           "FField" },
+        // direct FProperty subclasses
+        { "FStructProperty",     "FProperty" },
+        { "FObjectPropertyBase", "FProperty" },
+        { "FArrayProperty",      "FProperty" },
+        { "FByteProperty",       "FProperty" },
+        { "FBoolProperty",       "FProperty" },
+        { "FEnumProperty",       "FProperty" },
+        { "FSetProperty",        "FProperty" },
+        { "FMapProperty",        "FProperty" },
+        { "FInterfaceProperty",  "FProperty" },
+        { "FFieldPathProperty",  "FProperty" },
+        { "FDelegateProperty",   "FProperty" },
+        { "FOptionalProperty",   "FProperty" },
+        // indirect (FObjectPropertyBase / FClassProperty)
+        { "FClassProperty",      "FObjectPropertyBase" },
+        { "FSoftClassProperty",  "FClassProperty" },
+    };
+
+    // Build a set of existing CppNameOnly in CoreUObject Structures to avoid dup insert.
+    std::unordered_set<std::string> existing;
+    existing.reserve(corePkg->Structures.size());
+    for (const auto &s : corePkg->Structures) existing.insert(s.CppNameOnly);
+
+    for (const auto &t : kReflectionTypes)
+    {
+        if (existing.count(t.cppName)) continue;
+
+        UE_UPackage::Struct s;
+        s.Name         = t.cppName;
+        s.FullName     = std::string("ScriptStruct CoreUObject.") + t.cppName;
+        s.CppNameOnly  = t.cppName;
+        s.SuperCppName = t.parent;
+        s.CppName      = std::string("struct ") + t.cppName;
+        if (t.parent[0] != '\0')
+        {
+            s.CppName += " : ";
+            s.CppName += t.parent;
+            auto pit = sizeOf.find(t.parent);
+            s.Inherited = pit != sizeOf.end() ? pit->second : 0;
+        }
+        // FProperty's own fields may start at FField's data extent (FlagsPrivate+4),
+        // below sizeof(FField): standard layouts pack ArrayDim there, in FField's tail
+        // padding. sdkcoregen::PackBaseTailPadding ends FField's declaration at that
+        // extent; a layout with ArrayDim at sizeof(FField) gets a leading pad instead.
+        if (std::string(t.cppName) == "FProperty")
+            s.Inherited = static_cast<uint32_t>(offs.FField.FlagsPrivate + sizeof(int32_t));
+        s.Size = sizeOf[t.cppName];
+        // Members stays empty — augment() fills via fieldsFor() in next step.
+
+        corePkg->Structures.push_back(std::move(s));
+    }
+}
+
+// Settle each enum's underlying type against the members that store it. Runs over every
+// package at once, because an enum and the structs holding it usually live in different
+// ones.
+//
+// GenerateEnum infers a width from the enumerator values, which only bound the engine's
+// underlying type from below; the dumped size of a member declared with the enum is that
+// type. When every member storing an enum has the same width, and that width holds all of
+// its values, the enum takes it. The ProcessEvent parameter blocks declare parameters with
+// the enum type and carry no dumped offsets to check them, so they are only right if the
+// enum is.
+//
+// A member that still disagrees, because the enum is stored at several widths or a value
+// does not fit the storage width, is declared as the unsigned integer of its dumped width
+// with the enum named in its comment. Every member is then as wide as the dump says, which
+// the layout guards rely on.
+static void SettleEnumWidths(std::vector<UE_UPackage> &packages)
+{
+    using sdkcoregen::detail::BareTypeName;
+    using sdkcoregen::detail::DeclaredArrayDim;
+    using sdkcoregen::detail::IntegerWidth;
+    using sdkcoregen::detail::IsBitField;
+
+    auto integerType = [](uint32_t width) -> const char *
+    {
+        switch (width)
+        {
+        case 1: return "uint8_t";
+        case 2: return "uint16_t";
+        case 4: return "uint32_t";
+        case 8: return "uint64_t";
+        default: return nullptr;
+        }
+    };
+    // Width of one element; 0 when the size is not a whole number of elements.
+    auto elementWidth = [](const UE_UPackage::Member &m) -> uint32_t
+    {
+        const uint32_t dim = static_cast<uint32_t>(DeclaredArrayDim(m.Name));
+        return m.Size % dim == 0 ? m.Size / dim : 0;
+    };
+
+    std::unordered_map<std::string, UE_UPackage::Enum *> enums;
+    for (auto &p : packages)
+        for (auto &e : p.Enums)
+            enums.emplace(e.CppNameOnly, &e);
+
+    const std::vector<UE_UPackage::Struct *> structs = CollectStructs(packages);
+    auto forEachEnumMember = [&](auto &&fn)
+    {
+        for (auto *s : structs)
+            for (auto &m : s->Members)
+            {
+                if (IsBitField(m.Name))
+                    continue;
+                auto it = enums.find(BareTypeName(m.Type));
+                if (it != enums.end())
+                    fn(m, *it->second);
+            }
+    };
+
+    // 0 marks an enum stored at more than one width.
+    std::unordered_map<UE_UPackage::Enum *, uint32_t> storage;
+    forEachEnumMember([&](UE_UPackage::Member &m, UE_UPackage::Enum &e)
+    {
+        auto [it, inserted] = storage.emplace(&e, elementWidth(m));
+        if (!inserted && it->second != elementWidth(m))
+            it->second = 0;
+    });
+    for (auto [e, width] : storage)
+    {
+        const char *type = integerType(width);
+        if (!type || width <= static_cast<uint32_t>(IntegerWidth(e->UnderlyingType)))
+            continue;
+        e->UnderlyingType = type;
+        e->CppName = "enum class " + e->CppNameOnly + " : " + e->UnderlyingType;
+    }
+
+    forEachEnumMember([&](UE_UPackage::Member &m, UE_UPackage::Enum &e)
+    {
+        const uint32_t width = elementWidth(m);
+        const char *type = integerType(width);
+        if (!type || width == static_cast<uint32_t>(IntegerWidth(e.UnderlyingType)))
+            return;
+        if (!m.extra.empty())
+            m.extra += ", ";
+        m.extra += "holds " + e.CppNameOnly + " (" + e.UnderlyingType + ")";
+        m.Type = type;
+    });
+}
+
+void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback)
+{
+    _sdkProcessed.clear();
+    _sdkNameToPkg.clear();
+    _sdkEnumUnderlying.clear();
+    _sdkPkgOrder.clear();
+    _sdkPackagesUnsaved.clear();
 
     SimpleProgressBar dumpProgress(int(packages.size()));
     if (progressCallback)
@@ -343,90 +598,655 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
 
     auto excludedObjects = _profile->GetExcludedObjects();
 
-    for (UE_UPackage package : packages)
+    _sdkProcessed.reserve(packages.size());
+
+    auto isExcluded = [&excludedObjects](const std::string &fullName)
     {
-        package.Process();
+        return !excludedObjects.empty() && kVECTOR_CONTAINS(excludedObjects, fullName);
+    };
+
+    for (auto &raw : packages)
+    {
+        UE_UPackage pkg(raw);
+        pkg.Process();
 
         dumpProgress++;
         if (progressCallback)
             progressCallback(dumpProgress);
 
-        if (package.Classes.size() || package.Structures.size() || package.Enums.size())
+        if (excludedObjects.size())
         {
-            aioBufferFmt.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
-                                package.GetObject().GetName(), package.Enums.size(), package.Structures.size(), package.Classes.size());
-
-            if (package.Enums.size())
-            {
-                auto pkgEnums = package.Enums;
-
-                if (excludedObjects.size())
-                {
-                    pkgEnums.erase(
-                        std::remove_if(pkgEnums.begin(), pkgEnums.end(),
-                                       [&excludedObjects](const UE_UPackage::Enum &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgEnums.end());
-                }
-
-                UE_UPackage::AppendEnumsToBuffer(pkgEnums, &aioBufferFmt);
-            }
-
-            if (package.Structures.size())
-            {
-                auto pkgStructs = package.Structures;
-
-                if (excludedObjects.size())
-                {
-                    pkgStructs.erase(
-                        std::remove_if(pkgStructs.begin(), pkgStructs.end(),
-                                       [&excludedObjects](const UE_UPackage::Struct &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgStructs.end());
-                }
-
-                UE_UPackage::AppendStructsToBuffer(pkgStructs, &aioBufferFmt);
-            }
-
-            if (package.Classes.size())
-            {
-                auto pkgClasses = package.Classes;
-
-                if (excludedObjects.size())
-                {
-                    pkgClasses.erase(
-                        std::remove_if(pkgClasses.begin(), pkgClasses.end(),
-                                       [&excludedObjects](const UE_UPackage::Struct &it)
-                    { return kVECTOR_CONTAINS(excludedObjects, it.FullName); }),
-                        pkgClasses.end());
-                }
-
-                UE_UPackage::AppendStructsToBuffer(package.Classes, &aioBufferFmt);
-            }
-        }
-        else
-        {
-            packages_unsaved += "\t";
-            packages_unsaved += (package.GetObject().GetName() + ",\n");
-            continue;
+            pkg.Enums.erase(
+                std::remove_if(pkg.Enums.begin(), pkg.Enums.end(),
+                               [&](const UE_UPackage::Enum &it){ return isExcluded(it.FullName); }),
+                pkg.Enums.end());
+            pkg.Structures.erase(
+                std::remove_if(pkg.Structures.begin(), pkg.Structures.end(),
+                               [&](const UE_UPackage::Struct &it){ return isExcluded(it.FullName); }),
+                pkg.Structures.end());
+            pkg.Classes.erase(
+                std::remove_if(pkg.Classes.begin(), pkg.Classes.end(),
+                               [&](const UE_UPackage::Struct &it){ return isExcluded(it.FullName); }),
+                pkg.Classes.end());
         }
 
-        packages_saved++;
-        classes_saved += package.Classes.size();
-        structs_saved += package.Structures.size();
-        enums_saved += package.Enums.size();
+        _sdkProcessed.push_back(std::move(pkg));
+    }
 
-        for (const auto &cls : package.Classes)
+    // Drop preamble-provided names and collapse duplicates (UNone x N etc).
+    {
+        static const std::unordered_set<std::string> kPreambleProvided = {
+            "FName", "FString", "FText",
+            "FWeakObjectPtr", "FUniqueObjectGuid",
+            // FSoftObjectPath layout depends on per-game FName size; let dump emit it.
+            "FSoftObjectPtr",
+            "FScriptInterface", "FFieldPath", "FFieldClass", "FProperty",
+            "FScriptDelegate", "FDelegate",
+            "FMulticastInlineDelegate", "FMulticastDelegate",
+            "FMulticastSparseDelegate",
+            "TArray", "TMap", "TSet", "TPair",
+            "TWeakObjectPtr", "TLazyObjectPtr",
+            "TSoftObjectPtr", "TSoftClassPtr",
+            "TSubclassOf", "TScriptInterface", "TFieldPath",
+            "None", "FNone",
+        };
+
+        std::unordered_set<std::string> seenNames = kPreambleProvided;
+
+        auto dropDups = [&seenNames](auto &vec)
+        {
+            using ItemT = typename std::remove_reference_t<decltype(vec)>::value_type;
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(),
+                               [&seenNames](const ItemT &it)
+                               {
+                                   if (seenNames.count(it.CppNameOnly)) return true;
+                                   seenNames.insert(it.CppNameOnly);
+                                   return false;
+                               }),
+                vec.end());
+        };
+
+        for (auto &p : _sdkProcessed)
+        {
+            dropDups(p.Enums);
+            dropDups(p.Structures);
+            dropDups(p.Classes);
+        }
+    }
+
+    // Synthesize FField / FProperty + subclasses into CoreUObject before augment.
+    // These types aren't UObjects so the walker never produces them; we mint empty
+    // Struct entries here and let augment() fill members from UE_Offsets.
+    SynthesizeReflectionTypes();
+
+    // Augment core reflection classes (UObject/UField/UStruct/UEnum/UFunction/UClass):
+    // stitch typed members back in over the opaque Pad_0xN[] regions the
+    // property walker produces, using offsets from UE_Offsets.
+    {
+        const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
+        const uint32_t fnameSize = static_cast<uint32_t>(offs.FName.Size ? offs.FName.Size : 8);
+
+        const uintptr_t arrayInnerOff = offs.FArrayProperty.Inner;
+        const uintptr_t setElemOff    = offs.FSetProperty.ElementProp;
+        const uintptr_t mapKeyOff     = offs.FMapProperty.KeyProp;
+        const uintptr_t mapValueOff   = offs.FMapProperty.ValueProp;
+
+        struct KnownField
+        {
+            uintptr_t Offset;
+            uint32_t  Size;
+            std::string Type;
+            std::string Name;
+        };
+
+        auto fieldsFor = [&](const std::string &cppName) -> std::vector<KnownField>
+        {
+            std::vector<KnownField> v;
+            auto add = [&](uintptr_t off, uint32_t size, std::string type, std::string name,
+                           bool allowZeroOffset = false)
+            {
+                // offset 0 = not discovered; skip
+                if (off == 0 && !allowZeroOffset) return;
+                v.push_back({off, size, std::move(type), std::move(name)});
+            };
+
+            if (cppName == "UObject")
+            {
+                // synthetic vtable slot; dumper has no offset, force-emit at 0
+                add(0,                          8, "void**",           "VTable", true);
+                add(offs.UObject.ClassPrivate,  8, "struct UClass*",   "ClassPrivate");
+                add(offs.UObject.OuterPrivate,  8, "struct UObject*",  "OuterPrivate");
+                add(offs.UObject.ObjectFlags,   4, "uint32_t",         "ObjectFlags");
+                add(offs.UObject.NamePrivate,   fnameSize, "FName",    "NamePrivate");
+                add(offs.UObject.InternalIndex, 4, "int32_t",          "InternalIndex");
+            }
+            else if (cppName == "UField")
+            {
+                add(offs.UField.Next, 8, "struct UField*", "Next");
+            }
+            else if (cppName == "UStruct")
+            {
+                if (offs.Config.isUsingStructBaseChain)
+                {
+                    add(offs.UStruct.SuperStruct - 0x10, 8, "void**",  "StructBaseChainArray");
+                    add(offs.UStruct.SuperStruct - 0x8,  4, "int32_t", "NumStructBasesInChainMinusOne");
+                }
+                add(offs.UStruct.PropertiesSize,  4, "int32_t",         "PropertiesSize");
+                add(offs.UStruct.SuperStruct,     8, "struct UStruct*", "SuperStruct");
+                add(offs.UStruct.Children,        8, "struct UField*",  "Children");
+                add(offs.UStruct.ChildProperties, 8, "struct FField*",  "ChildProperties");
+            }
+            else if (cppName == "UEnum")
+            {
+                add(offs.UEnum.Names, 16, "TArray<TPair<FName, int64_t>>", "Names");
+            }
+            else if (cppName == "UFunction")
+            {
+                add(offs.UFunction.NumParams,      1, "uint8_t",  "NumParams");
+                add(offs.UFunction.ParamSize,      2, "uint16_t", "ParamSize");
+                add(offs.UFunction.EFunctionFlags, 4, "uint32_t", "EFunctionFlags");
+                add(offs.UFunction.Func,           8, "void*",    "Func");
+            }
+            else if (cppName == "UClass")
+            {
+                add(offs.UClass.CastFlags,     8, "EClassCastFlags", "CastFlags");
+                add(offs.UClass.DefaultObject, 8, "struct UObject*", "DefaultObject");
+            }
+            // FField hierarchy (synthesized by SynthesizeReflectionTypes).
+            // All offsets here are members of a synthesized empty Struct; pass
+            // allowZeroOffset=true since legitimate offsets begin at 0 (e.g.
+            // FFieldClass::Name).
+            else if (cppName == "FFieldClass")
+            {
+                add(offs.FFieldClass.Name,       fnameSize, "FName",               "Name", true);
+                add(offs.FFieldClass.Id,         8,         "uint64_t",            "Id");
+                add(offs.FFieldClass.CastFlags,  8,         "uint64_t",            "CastFlags");
+                add(offs.FFieldClass.ClassFlags, 4,         "EClassFlags",         "ClassFlags");
+                add(offs.FFieldClass.SuperClass, 8,         "struct FFieldClass*", "SuperClass");
+            }
+            else if (cppName == "FField")
+            {
+                add(0, 8, "void**", "VTable", true);
+                add(offs.FField.Owner,              16,        "FFieldVariant",       "Owner");
+                add(offs.FField.ClassPrivate,       8,         "struct FFieldClass*", "ClassPrivate");
+                add(offs.FField.Next,               8,         "struct FField*",      "Next");
+                add(offs.FField.NamePrivate,        fnameSize, "FName",               "NamePrivate");
+                add(offs.FField.FlagsPrivate,       4,         "int32_t",             "FlagsPrivate");
+            }
+            else if (cppName == "FProperty")
+            {
+                add(offs.FProperty.ArrayDim,        4, "int32_t",  "ArrayDim");
+                add(offs.FProperty.ElementSize,     4, "int32_t",  "ElementSize");
+                add(offs.FProperty.PropertyFlags,   8, "uint64_t", "PropertyFlags");
+                add(offs.FProperty.Offset_Internal, 4, "int32_t",  "Offset_Internal");
+            }
+            // FProperty subclasses — tail data lives at FProperty.SubPropertyBase.
+            else if (cppName == "FStructProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UStruct*", "Struct", true);
+            }
+            else if (cppName == "FObjectPropertyBase")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "PropertyClass", true);
+            }
+            else if (cppName == "FClassProperty")
+            {
+                add(offs.FProperty.SubPropertyBase + sizeof(void *), 8, "struct UClass*", "MetaClass", true);
+            }
+            else if (cppName == "FArrayProperty")
+            {
+                add(arrayInnerOff, 8, "struct FProperty*", "Inner", true);
+            }
+            else if (cppName == "FByteProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UEnum*", "Enum", true);
+            }
+            else if (cppName == "FBoolProperty")
+            {
+                add(offs.FBoolProperty.FieldSize + 0, 1, "uint8_t", "FieldSize", true);
+                add(offs.FBoolProperty.FieldSize + 1, 1, "uint8_t", "ByteOffset", true);
+                add(offs.FBoolProperty.FieldSize + 2, 1, "uint8_t", "ByteMask", true);
+                add(offs.FBoolProperty.FieldSize + 3, 1, "uint8_t", "FieldMask", true);
+            }
+            else if (cppName == "FEnumProperty")
+            {
+                add(offs.FEnumProperty.UnderlyingType, 8, "struct FProperty*", "UnderlyingType", true);
+                add(offs.FEnumProperty.Enum,           8, "struct UEnum*",     "Enum", true);
+            }
+            else if (cppName == "FSetProperty")
+            {
+                add(setElemOff, 8, "struct FProperty*", "ElementProp", true);
+            }
+            else if (cppName == "FMapProperty")
+            {
+                add(mapKeyOff,   8, "struct FProperty*", "KeyProp",   true);
+                add(mapValueOff, 8, "struct FProperty*", "ValueProp", true);
+            }
+            else if (cppName == "FInterfaceProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "InterfaceClass", true);
+            }
+            else if (cppName == "FFieldPathProperty")
+            {
+                add(offs.FProperty.Size, fnameSize, "FName", "PropertyName", true);
+            }
+            else if (cppName == "FDelegateProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct UFunction*", "SignatureFunction", true);
+            }
+            else if (cppName == "FOptionalProperty")
+            {
+                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "ValueProperty", true);
+            }
+            // FSoftClassProperty: no new fields beyond FClassProperty.
+            return v;
+        };
+
+        auto augment = [&](UE_UPackage::Struct &s)
+        {
+            auto fields = fieldsFor(s.CppNameOnly);
+            if (fields.empty()) return;
+
+            std::sort(fields.begin(), fields.end(),
+                      [](const KnownField &a, const KnownField &b) { return a.Offset < b.Offset; });
+
+            // drop fields inside inherited range or past struct size
+            fields.erase(
+                std::remove_if(fields.begin(), fields.end(),
+                               [&](const KnownField &f) {
+                                   return f.Offset < s.Inherited
+                                       || f.Offset + f.Size > s.Size;
+                               }),
+                fields.end());
+            if (fields.empty()) return;
+
+            std::vector<UE_UPackage::Member> rebuilt;
+            rebuilt.reserve(fields.size() * 2 + 1);
+
+            uint32_t cursor = s.Inherited;
+            for (const auto &f : fields)
+            {
+                if (f.Offset > cursor)
+                {
+                    UE_UPackage::Member pad;
+                    pad.Type   = "uint8_t";
+                    pad.Name   = fmt::format("Pad_0x{:X}[0x{:X}]", cursor, f.Offset - cursor);
+                    pad.Offset = cursor;
+                    pad.Size   = f.Offset - cursor;
+                    rebuilt.push_back(std::move(pad));
+                }
+                UE_UPackage::Member m;
+                m.Type   = f.Type;
+                m.Name   = f.Name;
+                m.Offset = static_cast<uint32_t>(f.Offset);
+                m.Size   = f.Size;
+                UE_UPackage::ExtractTypeDeps(m.Type, s.FullDeps, s.ForwardDeps);
+                rebuilt.push_back(std::move(m));
+                cursor = static_cast<uint32_t>(f.Offset + f.Size);
+            }
+            if (cursor < s.Size)
+            {
+                UE_UPackage::Member pad;
+                pad.Type   = "uint8_t";
+                pad.Name   = fmt::format("Pad_0x{:X}[0x{:X}]", cursor, s.Size - cursor);
+                pad.Offset = cursor;
+                pad.Size   = s.Size - cursor;
+                rebuilt.push_back(std::move(pad));
+            }
+
+            // strip self-reference re-added by ExtractTypeDeps
+            s.FullDeps.erase(s.CppNameOnly);
+            s.ForwardDeps.erase(s.CppNameOnly);
+
+            s.Members = std::move(rebuilt);
+
+            // Self-validating layout guard for the synthesized core types. The members above
+            // are placed at offsets from UE_Offsets with gaps padded; if those offsets are
+            // inconsistent with a member's declared size (e.g. FName=0xC vs a FlagsPrivate
+            // computed for 0x8 — which silently shifts FProperty::Offset_Internal and breaks
+            // reflection), the emitted C++ struct's sizeof diverges from the dumped size.
+            // Emit a static_assert so that mismatch fails to COMPILE instead of resolving
+            // wrong offsets at runtime. Only for 8-aligned dumped sizes — pointer-bearing
+            // structs whose C++ sizeof equals the dumped size; non-aligned tails (FBoolProperty,
+            // FFieldPathProperty) round up under C++ alignment and would false-trip.
+            if (s.Size && (s.Size % 8 == 0))
+                s.Trailer = fmt::format(
+                    "static_assert(sizeof({}) == 0x{:X}, \"{} layout mismatch vs dumped size — re-dump SDK\");",
+                    s.CppNameOnly, s.Size, s.CppNameOnly);
+
+            if (s.CppNameOnly == "UObject")
+            {
+                s.PrefixDecls = "";
+                s.ExtraDecls =
+                    "\tvoid ProcessEvent(struct UFunction* Function, void* Parms) const;\n"
+                    "\n"
+                    "\tstd::string GetName() const;\n"
+                    "\tstd::string GetFullName() const;\n"
+                    "\n"
+                    "\tbool IsA(EClassCastFlags TypeFlags) const;\n"
+                    "\tbool IsA(struct UClass* cmp) const;\n"
+                    "\tbool HasTypeFlag(EClassCastFlags TypeFlags) const;\n"
+                    "\tbool IsDefaultObject() const;\n"
+                    "\n"
+                    "\tvoid TraverseSupers(const std::function<bool(const struct UObject*)>& Callback) const;\n"
+                    "\n"
+                    "\tstatic struct UObject* FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType = EClassCastFlags{});\n"
+                    "\tstatic struct UObject* FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType = EClassCastFlags{});\n"
+                    "\n"
+                    "\ttemplate<typename UEType = UObject>\n"
+                    "\tstatic UEType* FindObject(const std::string& FullName, EClassCastFlags RequiredType = EClassCastFlags{})\n"
+                    "\t{ return static_cast<UEType*>(FindObjectImpl(FullName, RequiredType)); }\n"
+                    "\n"
+                    "\ttemplate<typename UEType = UObject>\n"
+                    "\tstatic UEType* FindObjectFast(const std::string& Name, EClassCastFlags RequiredType = EClassCastFlags{})\n"
+                    "\t{ return static_cast<UEType*>(FindObjectFastImpl(Name, RequiredType)); }\n"
+                    "\n"
+                    "\tstatic struct UClass* FindClass(const std::string& ClassFullName);\n"
+                    "\tstatic struct UClass* FindClassFast(const std::string& ClassName);\n";
+            }
+            else if (s.CppNameOnly == "UStruct" && offs.Config.isUsingStructBaseChain)
+            {
+                s.ExtraDecls =
+                    "\t// FStructBaseChain, the other base UStruct derives from: StructBaseChainArray is\n"
+                    "\t// the ancestry as a flat array of FStructBaseChain*, indexed by depth from the\n"
+                    "\t// root. Each element points at another UStruct's own subobject, which starts at\n"
+                    "\t// StructBaseChainArray, so BaseChainSelf() is what an element compares against.\n"
+                    "\tconst void* BaseChainSelf() const\n"
+                    "\t{\n"
+                    "\t\treturn static_cast<const void*>(&StructBaseChainArray);\n"
+                    "\t}\n";
+            }
+            else if (s.CppNameOnly == "UClass")
+            {
+                s.ExtraDecls =
+                    "\tstruct UFunction* GetFunction(const std::string& ClassName, "
+                    "const std::string& FuncName) const;\n";
+            }
+        };
+
+        for (auto &p : _sdkProcessed)
+        {
+            for (auto &c : p.Classes)    augment(c);
+            for (auto &s : p.Structures) augment(s); // harmless on non-targets
+        }
+
+        // Emit DEFINE_UE_CLASS_HELPERS on every Class (skips ScriptStructs).
+        for (auto &p : _sdkProcessed)
+        {
+            for (auto &c : p.Classes)
+            {
+                c.PrefixDecls += fmt::format(
+                    "\tDEFINE_UE_CLASS_HELPERS({}, \"{}\")\n",
+                    c.CppNameOnly, c.Name);
+            }
+        }
+
+        // Inject math operators + helpers on canonical UE math structs.
+        // Member-scoped so they can't collide with user code.
+        for (auto &p : _sdkProcessed)
+        {
+            for (auto &s : p.Structures)
+            {
+                const char* mathOps = nullptr;
+                if (s.CppNameOnly == "FVector")
+                {
+                    mathOps = R"FVOPS(
+	constexpr FVector() = default;
+	constexpr FVector(float InX, float InY, float InZ) : X(InX), Y(InY), Z(InZ) {}
+	FVector  operator+(const FVector& o) const { return {X + o.X, Y + o.Y, Z + o.Z}; }
+	FVector  operator-(const FVector& o) const { return {X - o.X, Y - o.Y, Z - o.Z}; }
+	FVector  operator*(const FVector& o) const { return {X * o.X, Y * o.Y, Z * o.Z}; }
+	FVector  operator/(const FVector& o) const { return {X / o.X, Y / o.Y, Z / o.Z}; }
+	FVector  operator*(float s)          const { return {X * s, Y * s, Z * s}; }
+	FVector  operator/(float s)          const { return {X / s, Y / s, Z / s}; }
+	FVector  operator-()                 const { return {-X, -Y, -Z}; }
+	FVector& operator+=(const FVector& o)      { X += o.X; Y += o.Y; Z += o.Z; return *this; }
+	FVector& operator-=(const FVector& o)      { X -= o.X; Y -= o.Y; Z -= o.Z; return *this; }
+	FVector& operator*=(float s)               { X *= s;   Y *= s;   Z *= s;   return *this; }
+	FVector& operator/=(float s)               { X /= s;   Y /= s;   Z /= s;   return *this; }
+	bool     operator==(const FVector& o) const{ return X == o.X && Y == o.Y && Z == o.Z; }
+	bool     operator!=(const FVector& o) const{ return !(*this == o); }
+	float    LengthSquared() const             { return X*X + Y*Y + Z*Z; }
+	float    Length()        const             { return std::sqrt(LengthSquared()); }
+	float    Dot(const FVector& o)  const      { return X*o.X + Y*o.Y + Z*o.Z; }
+	FVector  Cross(const FVector& o) const     { return {Y*o.Z - Z*o.Y, Z*o.X - X*o.Z, X*o.Y - Y*o.X}; }
+	float    Distance(const FVector& o) const  { return (*this - o).Length(); }
+	bool     IsNearlyZero(float t = 1e-4f) const { return std::abs(X) <= t && std::abs(Y) <= t && std::abs(Z) <= t; }
+	FVector  GetSafeNormal(float t = 1e-4f) const { float l = Length(); return l > t ? FVector{X/l, Y/l, Z/l} : FVector{0,0,0}; }
+	std::string ToString() const { char b[64]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f Z=%.3f", X, Y, Z); return std::string(b); }
+)FVOPS";
+                }
+                else if (s.CppNameOnly == "FVector2D")
+                {
+                    mathOps = R"FV2OPS(
+	constexpr FVector2D() = default;
+	constexpr FVector2D(float InX, float InY) : X(InX), Y(InY) {}
+	FVector2D  operator+(const FVector2D& o) const { return {X + o.X, Y + o.Y}; }
+	FVector2D  operator-(const FVector2D& o) const { return {X - o.X, Y - o.Y}; }
+	FVector2D  operator*(const FVector2D& o) const { return {X * o.X, Y * o.Y}; }
+	FVector2D  operator/(const FVector2D& o) const { return {X / o.X, Y / o.Y}; }
+	FVector2D  operator*(float s)            const { return {X * s, Y * s}; }
+	FVector2D  operator/(float s)            const { return {X / s, Y / s}; }
+	FVector2D  operator-()                   const { return {-X, -Y}; }
+	FVector2D& operator+=(const FVector2D& o)      { X += o.X; Y += o.Y; return *this; }
+	FVector2D& operator-=(const FVector2D& o)      { X -= o.X; Y -= o.Y; return *this; }
+	FVector2D& operator*=(float s)                 { X *= s; Y *= s; return *this; }
+	FVector2D& operator/=(float s)                 { X /= s; Y /= s; return *this; }
+	bool       operator==(const FVector2D& o) const{ return X == o.X && Y == o.Y; }
+	bool       operator!=(const FVector2D& o) const{ return !(*this == o); }
+	float      LengthSquared() const               { return X*X + Y*Y; }
+	float      Length()        const               { return std::sqrt(LengthSquared()); }
+	float      Dot(const FVector2D& o) const       { return X*o.X + Y*o.Y; }
+	float      Distance(const FVector2D& o) const  { return (*this - o).Length(); }
+	bool       IsNearlyZero(float t = 1e-4f) const { return std::abs(X) <= t && std::abs(Y) <= t; }
+	FVector2D  GetSafeNormal(float t = 1e-4f) const { float l = Length(); return l > t ? FVector2D{X/l, Y/l} : FVector2D{0,0}; }
+	std::string ToString() const { char b[48]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f", X, Y); return std::string(b); }
+)FV2OPS";
+                }
+                else if (s.CppNameOnly == "FVector4")
+                {
+                    mathOps = R"FV4OPS(
+	constexpr FVector4() = default;
+	constexpr FVector4(float InX, float InY, float InZ, float InW) : X(InX), Y(InY), Z(InZ), W(InW) {}
+	FVector4  operator+(const FVector4& o) const { return {X + o.X, Y + o.Y, Z + o.Z, W + o.W}; }
+	FVector4  operator-(const FVector4& o) const { return {X - o.X, Y - o.Y, Z - o.Z, W - o.W}; }
+	FVector4  operator*(float s)           const { return {X * s, Y * s, Z * s, W * s}; }
+	FVector4  operator/(float s)           const { return {X / s, Y / s, Z / s, W / s}; }
+	FVector4  operator-()                  const { return {-X, -Y, -Z, -W}; }
+	FVector4& operator+=(const FVector4& o)      { X += o.X; Y += o.Y; Z += o.Z; W += o.W; return *this; }
+	FVector4& operator-=(const FVector4& o)      { X -= o.X; Y -= o.Y; Z -= o.Z; W -= o.W; return *this; }
+	FVector4& operator*=(float s)                { X *= s; Y *= s; Z *= s; W *= s; return *this; }
+	FVector4& operator/=(float s)                { X /= s; Y /= s; Z /= s; W /= s; return *this; }
+	bool      operator==(const FVector4& o) const{ return X == o.X && Y == o.Y && Z == o.Z && W == o.W; }
+	bool      operator!=(const FVector4& o) const{ return !(*this == o); }
+	float     LengthSquared() const              { return X*X + Y*Y + Z*Z + W*W; }
+	float     Length()        const              { return std::sqrt(LengthSquared()); }
+	float     Dot(const FVector4& o) const       { return X*o.X + Y*o.Y + Z*o.Z + W*o.W; }
+	bool      IsNearlyZero(float t = 1e-4f) const{ return std::abs(X) <= t && std::abs(Y) <= t && std::abs(Z) <= t && std::abs(W) <= t; }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "X=%.3f Y=%.3f Z=%.3f W=%.3f", X, Y, Z, W); return std::string(b); }
+)FV4OPS";
+                }
+                else if (s.CppNameOnly == "FRotator")
+                {
+                    mathOps = R"FROPS(
+	constexpr FRotator() = default;
+	constexpr FRotator(float InPitch, float InYaw, float InRoll) : Pitch(InPitch), Yaw(InYaw), Roll(InRoll) {}
+	FRotator  operator+(const FRotator& o) const { return {Pitch + o.Pitch, Yaw + o.Yaw, Roll + o.Roll}; }
+	FRotator  operator-(const FRotator& o) const { return {Pitch - o.Pitch, Yaw - o.Yaw, Roll - o.Roll}; }
+	FRotator  operator*(float s)           const { return {Pitch * s, Yaw * s, Roll * s}; }
+	FRotator  operator/(float s)           const { return {Pitch / s, Yaw / s, Roll / s}; }
+	FRotator  operator-()                  const { return {-Pitch, -Yaw, -Roll}; }
+	FRotator& operator+=(const FRotator& o)      { Pitch += o.Pitch; Yaw += o.Yaw; Roll += o.Roll; return *this; }
+	FRotator& operator-=(const FRotator& o)      { Pitch -= o.Pitch; Yaw -= o.Yaw; Roll -= o.Roll; return *this; }
+	FRotator& operator*=(float s)                { Pitch *= s; Yaw *= s; Roll *= s; return *this; }
+	FRotator& operator/=(float s)                { Pitch /= s; Yaw /= s; Roll /= s; return *this; }
+	bool      operator==(const FRotator& o) const{ return Pitch == o.Pitch && Yaw == o.Yaw && Roll == o.Roll; }
+	bool      operator!=(const FRotator& o) const{ return !(*this == o); }
+	bool      IsNearlyZero(float t = 1e-4f) const{ return std::abs(Pitch) <= t && std::abs(Yaw) <= t && std::abs(Roll) <= t; }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "P=%.3f Y=%.3f R=%.3f", Pitch, Yaw, Roll); return std::string(b); }
+)FROPS";
+                }
+                else if (s.CppNameOnly == "FLinearColor")
+                {
+                    mathOps = R"FLCOPS(
+	constexpr FLinearColor() = default;
+	constexpr FLinearColor(float InR, float InG, float InB, float InA = 1.0f) : R(InR), G(InG), B(InB), A(InA) {}
+	constexpr explicit FLinearColor(uint32_t hex) : R(((hex >> 16) & 0xFF) / 255.0f), G(((hex >> 8) & 0xFF) / 255.0f), B((hex & 0xFF) / 255.0f), A(1.0f) {}
+	FLinearColor  operator+(const FLinearColor& o) const { return {R + o.R, G + o.G, B + o.B, A + o.A}; }
+	FLinearColor  operator-(const FLinearColor& o) const { return {R - o.R, G - o.G, B - o.B, A - o.A}; }
+	FLinearColor  operator*(const FLinearColor& o) const { return {R * o.R, G * o.G, B * o.B, A * o.A}; }
+	FLinearColor  operator*(float s)               const { return {R * s, G * s, B * s, A * s}; }
+	FLinearColor  operator/(float s)               const { return {R / s, G / s, B / s, A / s}; }
+	FLinearColor& operator+=(const FLinearColor& o)      { R += o.R; G += o.G; B += o.B; A += o.A; return *this; }
+	FLinearColor& operator-=(const FLinearColor& o)      { R -= o.R; G -= o.G; B -= o.B; A -= o.A; return *this; }
+	FLinearColor& operator*=(float s)                    { R *= s; G *= s; B *= s; A *= s; return *this; }
+	FLinearColor& operator/=(float s)                    { R /= s; G /= s; B /= s; A /= s; return *this; }
+	bool          operator==(const FLinearColor& o) const{ return R == o.R && G == o.G && B == o.B && A == o.A; }
+	bool          operator!=(const FLinearColor& o) const{ return !(*this == o); }
+	std::string ToString() const { char b[80]; std::snprintf(b, sizeof(b), "R=%.3f G=%.3f B=%.3f A=%.3f", R, G, B, A); return std::string(b); }
+)FLCOPS";
+                }
+
+                if (mathOps)
+                {
+                    if (!SDKMathNames::Canonicalize(s.CppNameOnly, s.Members))
+                        continue;
+                    if (!s.ExtraDecls.empty())
+                        s.ExtraDecls += "\n";
+                    s.ExtraDecls += mathOps;
+                }
+            }
+        }
+    }
+
+    // Drop packages that ended up with nothing to emit
+    std::string _sdkPackagesUnsaved;
+    {
+        std::vector<UE_UPackage> kept;
+        kept.reserve(_sdkProcessed.size());
+        for (auto &p : _sdkProcessed)
+        {
+            if (!p.Classes.empty() || !p.Structures.empty() || !p.Enums.empty())
+            {
+                kept.push_back(std::move(p));
+            }
+            else
+            {
+                _sdkPackagesUnsaved += "\t";
+                _sdkPackagesUnsaved += p.PackageName + ",\n";
+            }
+        }
+        _sdkProcessed = std::move(kept);
+    }
+
+    if (_sdkProcessed.empty())
+        return;
+
+    SettleEnumWidths(_sdkProcessed);
+
+    _sdkNameToPkg.reserve(_sdkProcessed.size() * 64);
+
+    auto registerType = [&](const std::string &name, size_t pkgIdx)
+    {
+        if (name.empty()) return;
+        _sdkNameToPkg.emplace(name, pkgIdx);
+    };
+
+    for (size_t i = 0; i < _sdkProcessed.size(); ++i)
+    {
+        for (const auto &s : _sdkProcessed[i].Structures) registerType(s.CppNameOnly, i);
+        for (const auto &c : _sdkProcessed[i].Classes)    registerType(c.CppNameOnly, i);
+        for (const auto &e : _sdkProcessed[i].Enums)
+        {
+            registerType(e.CppNameOnly, i);
+            _sdkEnumUnderlying.emplace(e.CppNameOnly, e.UnderlyingType);
+        }
+    }
+
+    // only full deps drive package order; fwd-decls handled separately
+    std::vector<std::unordered_set<size_t>> pkgDeps(_sdkProcessed.size());
+
+    auto recordDeps = [&](size_t pkgIdx, const UE_UPackage::Struct &s)
+    {
+        for (const auto &dep : s.FullDeps)
+        {
+            auto it = _sdkNameToPkg.find(dep);
+            if (it == _sdkNameToPkg.end()) continue;
+            if (it->second == pkgIdx) continue;
+            pkgDeps[pkgIdx].insert(it->second);
+        }
+    };
+
+    for (size_t i = 0; i < _sdkProcessed.size(); ++i)
+    {
+        for (const auto &s : _sdkProcessed[i].Structures) recordDeps(i, s);
+        for (const auto &c : _sdkProcessed[i].Classes)    recordDeps(i, c);
+    }
+
+    _sdkPkgOrder.reserve(_sdkProcessed.size());
+    {
+        std::vector<size_t> indices(_sdkProcessed.size());
+        for (size_t i = 0; i < _sdkProcessed.size(); ++i) indices[i] = i;
+
+        _sdkPkgOrder = TopoSort<size_t>(indices, [&](size_t i) -> const std::unordered_set<size_t> &
+        {
+            return pkgDeps[i];
+        });
+    }
+
+
+    // intra-package topo sort: value-type deps first
+    auto sortByDeps = [&](std::vector<UE_UPackage::Struct> &items)
+    {
+        std::unordered_map<std::string, size_t> nameToLocal;
+        nameToLocal.reserve(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+            nameToLocal.emplace(items[i].CppNameOnly, i);
+
+        std::vector<size_t> indices(items.size());
+        for (size_t i = 0; i < items.size(); ++i) indices[i] = i;
+
+        std::vector<std::vector<size_t>> deps(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            for (const auto &dep : items[i].FullDeps)
+            {
+                auto it = nameToLocal.find(dep);
+                if (it != nameToLocal.end()) deps[i].push_back(it->second);
+            }
+        }
+
+        auto sorted = TopoSort<size_t>(indices, [&](size_t i) -> const std::vector<size_t> &
+        {
+            return deps[i];
+        });
+
+        std::vector<UE_UPackage::Struct> reordered;
+        reordered.reserve(items.size());
+        for (size_t i : sorted) reordered.push_back(std::move(items[i]));
+        items = std::move(reordered);
+    };
+
+    for (auto &p : _sdkProcessed)
+    {
+        if (!p.Structures.empty()) sortByDeps(p.Structures);
+        if (!p.Classes.empty())    sortByDeps(p.Classes);
+    }
+
+    static bool processInternal_once = false;
+    for (size_t pkgIdx : _sdkPkgOrder)
+    {
+        const auto &pkg = _sdkProcessed[pkgIdx];
+        for (const auto &cls : pkg.Classes)
         {
             for (const auto &func : cls.Functions)
             {
-                // UObject::ProcessInternal for blueprint functions
                 if (!processInternal_once && (func.EFlags & FUNC_BlueprintEvent) && func.Func)
                 {
                     dumper_jf_ns::jsonFunctions.push_back({"UObject", "ProcessInternal", func.Func});
                     processInternal_once = true;
                 }
-
                 if ((func.EFlags & FUNC_Native) && func.Func)
                 {
                     std::string execFuncName = "exec";
@@ -435,8 +1255,7 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
                 }
             }
         }
-
-        for (const auto &st : package.Structures)
+        for (const auto &st : pkg.Structures)
         {
             for (const auto &func : st.Functions)
             {
@@ -449,14 +1268,659 @@ void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt, 
             }
         }
     }
+}
 
-    logsBufferFmt.append("Saved packages: {}\nSaved classes: {}\nSaved structs: {}\nSaved enums: {}\n", packages_saved, classes_saved, structs_saved, enums_saved);
 
-    if (packages_unsaved.size())
+static void EmitSDKFunctionsCppBodies(BufferFmt &buf, bool structBaseChain)
+{
+    buf.append("{}", R"AIOIMPL(void UObject::ProcessEvent(struct UFunction* Function, void* Parms) const
+{
+    check(Function);
+#ifdef SDK_PROCESS_EVENT
+    SDK_PROCESS_EVENT(const_cast<UObject*>(this), Function, Parms);
+#else
+    using FN = void(*)(const UObject*, struct UFunction*, void*);
+    auto vtbl = *reinterpret_cast<void* const* const*>(this);
+    check(vtbl);
+    reinterpret_cast<FN>(vtbl[kProcessEventIndex])(this, Function, Parms);
+#endif
+}
+
+class UObject* UObject::FindObjectImpl(const std::string& FullName, EClassCastFlags RequiredType)
+{
+    const int32_t N = GUObjectArray->GetObjectArrayNum();
+    for (int32_t i = 0; i < N; ++i)
     {
-        packages_unsaved.erase(packages_unsaved.size() - 2);
-        logsBufferFmt.append("Unsaved packages: [\n{}\n]\n", packages_unsaved);
+        FUObjectItem* Item = GUObjectArray->IndexToObject(i);
+        UObject* Object = Item ? Item->Object : nullptr;
+        if (!Object || (reinterpret_cast<uintptr_t>(Object) & 0x7) != 0)
+            continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetFullName() == FullName)
+            return Object;
+    }
+    return nullptr;
+}
+
+class UObject* UObject::FindObjectFastImpl(const std::string& Name, EClassCastFlags RequiredType)
+{
+    const int32_t N = GUObjectArray->GetObjectArrayNum();
+    for (int32_t i = 0; i < N; ++i)
+    {
+        FUObjectItem* Item = GUObjectArray->IndexToObject(i);
+        UObject* Object = Item ? Item->Object : nullptr;
+        if (!Object) continue;
+        if (Object->HasTypeFlag(RequiredType) && Object->GetName() == Name)
+            return Object;
+    }
+    return nullptr;
+}
+
+class UClass* UObject::FindClass(const std::string& ClassFullName)
+{
+    return FindObject<UClass>(ClassFullName, EClassCastFlags::Class);
+}
+
+class UClass* UObject::FindClassFast(const std::string& ClassName)
+{
+    return FindObjectFast<UClass>(ClassName, EClassCastFlags::Class);
+}
+
+std::string UObject::GetName() const
+{
+    return NamePrivate.ToString();
+}
+
+std::string UObject::GetFullName() const
+{
+    if (!ClassPrivate) return "None";
+    std::string Outers;
+    for (UObject* o = OuterPrivate; o; o = o->OuterPrivate)
+        Outers = o->GetName() + "." + Outers;
+    std::string r = ClassPrivate->GetName();
+    r += " ";
+    r += Outers;
+    r += GetName();
+    return r;
+}
+
+bool UObject::HasTypeFlag(EClassCastFlags TypeFlags) const
+{
+    if (!ClassPrivate) return false;
+    auto bits = static_cast<uint64_t>(TypeFlags);
+    if (bits == 0) return true; // EClassCastFlags::None
+    return (static_cast<uint64_t>(ClassPrivate->CastFlags) & bits) != 0;
+}
+
+bool UObject::IsA(EClassCastFlags TypeFlags) const
+{
+    return HasTypeFlag(TypeFlags);
+}
+
+)AIOIMPL");
+    if (structBaseChain)
+        buf.append("{}", R"AIOIMPL(bool UObject::IsA(class UClass* cmp) const
+{
+    if (!cmp || !ClassPrivate) return false;
+    if (ClassPrivate == cmp) return true;
+    // UStruct::IsChildOf, the way the engine answers it: the ancestry array is indexed
+    // by the target's own depth, so this is a bounds check and one compare rather than
+    // a walk. UE fills the array for every UStruct it builds; the walk covers a struct
+    // caught before it was filled.
+    if (void** chain = ClassPrivate->StructBaseChainArray)
+    {
+        const int32_t depth = cmp->NumStructBasesInChainMinusOne;
+        return depth <= ClassPrivate->NumStructBasesInChainMinusOne
+            && chain[depth] == cmp->BaseChainSelf();
+    }
+    for (const struct UStruct* s = ClassPrivate->SuperStruct; s; s = s->SuperStruct)
+    {
+        if (s == cmp) return true;
+    }
+    return false;
+}
+
+)AIOIMPL");
+    else
+        buf.append("{}", R"AIOIMPL(bool UObject::IsA(class UClass* cmp) const
+{
+    if (!cmp || !ClassPrivate) return false;
+    for (const struct UStruct* s = ClassPrivate; s; s = s->SuperStruct)
+    {
+        if (s == cmp) return true;
+    }
+    return false;
+}
+
+)AIOIMPL");
+    buf.append("{}", R"AIOIMPL(bool UObject::IsDefaultObject() const
+{
+    // EObjectFlags::ClassDefaultObject = 0x10
+    return (ObjectFlags & 0x10u) != 0;
+}
+
+void UObject::TraverseSupers(const std::function<bool(const UObject*)>& Callback) const
+{
+    const struct UStruct* Clss = nullptr;
+    if (HasTypeFlag(EClassCastFlags::Class))
+        Clss = static_cast<const struct UStruct*>(static_cast<const UClass*>(static_cast<const UObject*>(this)));
+    else if (ClassPrivate)
+        Clss = ClassPrivate;
+    while (Clss)
+    {
+        if (!Callback(Clss)) break;
+        Clss = Clss->SuperStruct;
+    }
+}
+
+)AIOIMPL");
+}
+
+static void EmitUClassGetFunctionBody(BufferFmt &buf, bool emitInline)
+{
+    const char *kw = emitInline ? "inline " : "";
+    buf.append(
+        "{}struct UFunction* UClass::GetFunction(const std::string& ClassName, "
+        "const std::string& FuncName) const\n"
+        "{{\n"
+        "    for (const struct UStruct* Clss = this; Clss; Clss = Clss->SuperStruct)\n"
+        "    {{\n"
+        "        if (Clss->GetName() != ClassName) continue;\n"
+        "        for (struct UField* Field = Clss->Children; Field; Field = Field->Next)\n"
+        "        {{\n"
+        "            if (Field->HasTypeFlag(EClassCastFlags::Function) "
+        "&& Field->GetName() == FuncName)\n"
+        "                return static_cast<struct UFunction*>(Field);\n"
+        "        }}\n"
+        "    }}\n"
+        "    return nullptr;\n"
+        "}}\n\n", kw);
+}
+
+static void EmitUFunctionBody(BufferFmt &buf,
+                              const UE_UPackage::Function &f,
+                              bool emitInline,
+                              const std::unordered_map<std::string, std::string> &enumUnderlying)
+{
+    const char *kw = emitInline ? "inline " : "";
+
+    // strip leading 'static ' — only valid in class-body declaration
+    std::string headOnly = f.CppName;
+    const std::string staticPrefix = "static ";
+    if (headOnly.compare(0, staticPrefix.size(), staticPrefix) == 0)
+        headOnly = headOnly.substr(staticPrefix.size());
+
+    // inject Owner:: qualifier
+    const auto spacePos = headOnly.rfind(' ');
+    if (spacePos == std::string::npos)
+        return; // malformed — skip
+    std::string qualifiedHead = headOnly.substr(0, spacePos + 1)
+                              + f.OwnerCppName + "::"
+                              + headOnly.substr(spacePos + 1);
+
+    const bool hasReturn = (f.ReturnType != "void");
+
+    // elaborated 'enum X' (not 'enum class') — clang rejects use-site enum class
+    auto qualifyType = [&](const std::string &t) -> std::string {
+        return enumUnderlying.count(t) ? "enum " + t : t;
+    };
+
+    buf.append("{}{}({})\n{{\n", kw, qualifiedHead, f.Params);
+
+    buf.append("    static struct UFunction* Func = nullptr;\n");
+    if (f.IsStatic)
+    {
+        buf.append("    if (!Func) Func = StaticClass()->GetFunction(\"{}\", \"{}\");\n",
+                   f.OwnerUEName, f.Name);
+    }
+    else
+    {
+        buf.append("    if (!Func) Func = ClassPrivate->GetFunction(\"{}\", \"{}\");\n",
+                   f.OwnerUEName, f.Name);
     }
 
+    // Parms struct: param order matches UE reflection, ReturnValue last
+    buf.append("    struct\n    {{\n");
+    for (const auto &p : f.ParamsList)
+    {
+        const std::string fieldType = qualifyType(p.Type);
+        if (p.ArrayDim > 1)
+            buf.append("        {} {}[0x{:X}];\n", fieldType, p.Name, p.ArrayDim);
+        else
+            buf.append("        {} {};\n", fieldType, p.Name);
+    }
+    if (hasReturn)
+        buf.append("        {} ReturnValue;\n", qualifyType(f.ReturnType));
+    buf.append("    }} Parms{{}};\n");
+
+    // fill in-params; pure out-params stay default-constructed.
+    // C-cast strips ConstParm const so refs bind to non-const Parms field.
+    for (const auto &p : f.ParamsList)
+    {
+        const bool isOut       = (p.Flags & CPF_OutParm) != 0;
+        const bool isConstOut  = isOut && (p.Flags & CPF_ConstParm) != 0;
+        const bool fillFromArg = !isOut || isConstOut;
+        if (!fillFromArg) continue;
+
+        if (p.ArrayDim > 1)
+            buf.append("    memcpy(Parms.{}, {}, sizeof({}) * 0x{:X});\n",
+                       p.Name, p.Name, p.Type, p.ArrayDim);
+        else
+            buf.append("    Parms.{} = ({}){};\n", p.Name, qualifyType(p.Type), p.Name);
+    }
+
+    if (f.IsStatic)
+        buf.append("    GetDefaultObj()->ProcessEvent(Func, &Parms);\n");
+    else
+        buf.append("    this->ProcessEvent(Func, &Parms);\n");
+
+    // copy out: pure out-params back to caller
+    for (const auto &p : f.ParamsList)
+    {
+        const bool isOut      = (p.Flags & CPF_OutParm) != 0;
+        const bool isConstOut = isOut && (p.Flags & CPF_ConstParm) != 0;
+        if (!isOut || isConstOut) continue;
+
+        if (p.ArrayDim > 1)
+            buf.append("    memcpy({}, Parms.{}, sizeof({}) * 0x{:X});\n",
+                       p.Name, p.Name, p.Type, p.ArrayDim);
+        else
+            buf.append("    {} = Parms.{};\n", p.Name, p.Name);
+    }
+
+    if (hasReturn)
+        buf.append("    return Parms.ReturnValue;\n");
+
+    buf.append("}}\n\n");
+}
+
+static void EmitPackageFunctionBodies(BufferFmt &buf,
+                                      const UE_UPackage &pkg,
+                                      bool emitInline,
+                                      const std::unordered_map<std::string, std::string> &enumUnderlying)
+{
+    for (const auto &c : pkg.Classes)
+    {
+        if (c.Functions.empty()) continue;
+        buf.append("// {}\n", c.CppNameOnly);
+        for (const auto &f : c.Functions)
+            EmitUFunctionBody(buf, f, emitInline, enumUnderlying);
+    }
+}
+
+// strip leading UTF-8 BOM (clang rejects U+FEFF); BOM may be at offset 0 or 1
+static std::string StripUtf8Bom(std::string content)
+{
+    constexpr const char *kBom = "\xef\xbb\xbf";
+    if (content.compare(0, 3, kBom) == 0)
+    {
+        content.erase(0, 3);
+    }
+    else if (content.size() >= 4 && content[0] == '\n'
+             && content.compare(1, 3, kBom) == 0)
+    {
+        content.erase(1, 3);
+    }
+    return content;
+}
+
+// retarget Basic.cpp's CoreUObject_classes.h include to .hpp
+static std::string RetargetBasicCppIncludes(std::string content)
+{
+    const std::string from = "#include \"CoreUObject_classes.h\"";
+    const std::string to   = "#include \"CoreUObject_classes.hpp\"";
+    auto pos = content.find(from);
+    if (pos != std::string::npos)
+        content.replace(pos, from.size(), to);
+    return content;
+}
+
+static void EmitSDKCoreFiles(
+    const std::string& prefix,
+    const UE_UPackage& corePkg,
+    int processEventIndex,
+    const sdkcoregen::FNameLayout& fnameLayout,
+    const sdkcoregen::UObjectArrayLayout& uobjArrayLayout,
+    const sdkcoregen::FTextLayout& textLayout,
+    const sdkcoregen::CoreTypeSizes& coreTypeSizes,
+    const std::unordered_map<std::string, std::string>& enumUnderlying,
+    bool structBaseChain,
+    std::unordered_map<std::string, BufferFmt>& outBuffersMap)
+{
+    outBuffersMap[prefix + "Basic.h"].append("{}",
+        StripUtf8Bom(sdkcoregen::SpliceLayoutCoreTypes(kUECoreBasicH, fnameLayout, uobjArrayLayout, textLayout,
+                                                       coreTypeSizes)));
+    outBuffersMap[prefix + "Basic.cpp"].append("{}",
+        RetargetBasicCppIncludes(StripUtf8Bom(kUECoreBasicCpp)));
+    outBuffersMap[prefix + "UnrealContainers.h"].append("{}", StripUtf8Bom(kUECoreUnrealContainersH));
+    outBuffersMap[prefix + "UEAssert.h"].append("{}", StripUtf8Bom(kUECoreUEAssertH));
+
+    // utfcpp shipped under <prefix>utfcpp/ so SDK is self-contained
+    outBuffersMap[prefix + "utfcpp/core.h"].append("{}", StripUtf8Bom(kUtfcppCoreH));
+    outBuffersMap[prefix + "utfcpp/unchecked.h"].append("{}", StripUtf8Bom(kUtfcppUncheckedH));
+
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_structs.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("#include \"Basic.h\"\n");
+        buf.append("#include \"UnrealContainers.h\"\n");
+        buf.append("#include <cmath>\n");
+        buf.append("#include <cstdio>\n\n"); // for injected math helpers + ToString
+
+        // DEFINE_UE_CLASS_HELPERS macro emitted once here; transitively
+        // pulled by _classes.hpp and every Packages/<pkg>.hpp.
+        buf.append("{}", R"AIOMACRO(#ifndef DEFINE_UE_CLASS_HELPERS
+#define DEFINE_UE_CLASS_HELPERS(FullClassName, ClassNameStr) \
+    static struct UClass* StaticClass() { return StaticClassImpl<ClassNameStr>(); } \
+    static struct FullClassName* GetDefaultObj() { return GetDefaultObjImpl<FullClassName>(); }
+#endif
+
+)AIOMACRO");
+
+        buf.append("namespace SDK\n{{\n\n");
+        buf.append("// Package: CoreUObject - Enums({}) + Structs({})\n\n",
+                   corePkg.Enums.size(), corePkg.Structures.size());
+        if (!corePkg.Enums.empty())
+            UE_UPackage::AppendEnumsToBuffer(const_cast<std::vector<UE_UPackage::Enum>&>(corePkg.Enums), &buf);
+        if (!corePkg.Structures.empty())
+            UE_UPackage::AppendStructsToBuffer(const_cast<std::vector<UE_UPackage::Struct>&>(corePkg.Structures), &buf);
+        buf.append("}} // namespace SDK\n");
+    }
+
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_classes.hpp"];
+        buf.append("#pragma once\n\n");
+        buf.append("#include \"CoreUObject_structs.hpp\"\n\n");
+        buf.append("namespace SDK\n{{\n\n");
+
+        buf.append("constexpr int kProcessEventIndex = {};\n\n", processEventIndex);
+
+        buf.append("// Package: CoreUObject - Classes({})\n\n", corePkg.Classes.size());
+
+        if (!corePkg.Classes.empty())
+            UE_UPackage::AppendStructsToBuffer(const_cast<std::vector<UE_UPackage::Struct>&>(corePkg.Classes), &buf);
+
+        buf.append("}} // namespace SDK\n");
+    }
+
+    {
+        auto &buf = outBuffersMap[prefix + "CoreUObject_functions.cpp"];
+        buf.append("// Bodies for UObject helpers + UFunction dispatch.\n");
+        buf.append("// Wire FName::s_NameResolver and point GUObjectArray at the live &FUObjectArray at startup.\n\n");
+        buf.append("#include \"Basic.h\"\n");
+        buf.append("#include \"CoreUObject_classes.hpp\"\n");
+        buf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
+        buf.append("// A consumer routes UObject::ProcessEvent through its own dispatcher by defining\n");
+        buf.append("// SDK_PROCESS_EVENT as a callable taking (UObject*, UFunction*, void*), and\n");
+        buf.append("// SDK_PROCESS_EVENT_INCLUDE as the header that declares it. Otherwise the call\n");
+        buf.append("// goes through the object's vtable at kProcessEventIndex.\n");
+        buf.append("#ifdef SDK_PROCESS_EVENT_INCLUDE\n#include SDK_PROCESS_EVENT_INCLUDE\n#endif\n\n");
+        buf.append("namespace SDK\n{{\n\n");
+        EmitSDKFunctionsCppBodies(buf, structBaseChain);
+        EmitUClassGetFunctionBody(buf, /*emitInline=*/false);
+        EmitPackageFunctionBodies(buf, corePkg, /*emitInline=*/false, enumUnderlying);
+        buf.append("}} // namespace SDK\n");
+    }
+}
+
+void UEDumper::DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt)
+{
+    if (_sdkProcessed.empty())
+    {
+        aioBufferFmt.append("#pragma once\n\n");
+        aioBufferFmt.append("// (empty dump — no packages processed)\n");
+        logsBufferFmt.append("Saved packages: 0\nSaved classes: 0\nSaved structs: 0\nSaved enums: 0\n");
+        if (!_sdkPackagesUnsaved.empty())
+        {
+            std::string un = _sdkPackagesUnsaved;
+            un.erase(un.size() - 2);
+            logsBufferFmt.append("Unsaved packages: [\n{}\n]\n", un);
+        }
+        logsBufferFmt.append("==========================\n");
+        return;
+    }
+
+    aioBufferFmt.append("#pragma once\n\n");
+    aioBufferFmt.append("// AIOHeader.hpp - browse-only types dump (not a compilation entry point).\n\n");
+    aioBufferFmt.append("namespace SDK\n{{\n\n");
+
+    int packages_saved = 0;
+    int classes_saved = 0;
+    int structs_saved = 0;
+    int enums_saved = 0;
+
+    for (size_t pkgIdx : _sdkPkgOrder)
+    {
+        auto &pkg = _sdkProcessed[pkgIdx];
+        aioBufferFmt.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
+                            pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
+        if (!pkg.Enums.empty())      UE_UPackage::AppendEnumsToBuffer(pkg.Enums, &aioBufferFmt);
+        if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &aioBufferFmt);
+        if (!pkg.Classes.empty())    UE_UPackage::AppendStructsToBuffer(pkg.Classes, &aioBufferFmt);
+
+        packages_saved++;
+        classes_saved += pkg.Classes.size();
+        structs_saved += pkg.Structures.size();
+        enums_saved   += pkg.Enums.size();
+    }
+
+    aioBufferFmt.append("}} // namespace SDK\n");
+
+    logsBufferFmt.append("Saved packages: {}\nSaved classes: {}\nSaved structs: {}\nSaved enums: {}\n",
+                         packages_saved, classes_saved, structs_saved, enums_saved);
+    if (!_sdkPackagesUnsaved.empty())
+    {
+        std::string un = _sdkPackagesUnsaved;
+        un.erase(un.size() - 2);
+        logsBufferFmt.append("Unsaved packages: [\n{}\n]\n", un);
+    }
+    logsBufferFmt.append("==========================\n");
+}
+
+void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<std::string, BufferFmt> &outBuffersMap)
+{
+    if (_sdkProcessed.empty())
+    {
+        logsBufferFmt.append("SDK: empty processed packages, skipping.\n");
+        return;
+    }
+
+    const size_t kNotFound = static_cast<size_t>(-1);
+    size_t coreIdx = kNotFound;
+    for (size_t i = 0; i < _sdkProcessed.size(); ++i)
+    {
+        if (_sdkProcessed[i].PackageName == "CoreUObject")
+        {
+            coreIdx = i;
+            break;
+        }
+    }
+    if (coreIdx == kNotFound)
+    {
+        logsBufferFmt.append("SDK: CoreUObject package not found in dump, skipping.\n");
+        return;
+    }
+
+    const std::string prefix = "SDK/";
+    const std::string pkgPrefix = prefix + "Packages/";
+
+    sdkcoregen::FNameLayout fnameLayout;  // defaults: 8B, non-CP, non-outline (Cmp@0, Number@4)
+    sdkcoregen::UObjectArrayLayout uobjArrayLayout;  // defaults: stride 0x18, Object@0, chunked 64K
+    sdkcoregen::FTextLayout textLayout;  // defaults: TextSource@0x28, no virtual display string
+    bool structBaseChain = false;
+    if (_profile && _profile->GetUEVars() && _profile->GetUEVars()->GetOffsets())
+    {
+        const UE_Offsets& o = *_profile->GetUEVars()->GetOffsets();
+        fnameLayout = {o.FName.Size ? static_cast<int32_t>(o.FName.Size) : 8,
+                       static_cast<int32_t>(o.FName.ComparisonIndex),
+                       static_cast<int32_t>(o.FName.DisplayIndex),
+                       static_cast<int32_t>(o.FName.Number),
+                       o.Config.isUsingCasePreservingName,
+                       o.Config.isUsingOutlineNumberName};
+        structBaseChain = o.Config.isUsingStructBaseChain;
+        if (o.FTextData.TextSource)
+            textLayout.TextSource = static_cast<int32_t>(o.FTextData.TextSource);
+        if (o.FTextData.GetDisplayString)
+            textLayout.GetDisplayStringIndex = static_cast<int32_t>(o.FTextData.GetDisplayString);
+        uobjArrayLayout.ItemStride = o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18;
+        uobjArrayLayout.ObjectOffset = static_cast<int32_t>(o.FUObjectItem.Object);
+        uobjArrayLayout.NumElementsPerChunk = static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk);
+        // A profile with a reordered object array sets MaxElements/MaxChunks/NumChunks, and
+        // then every count offset is taken as given (0 included). Otherwise -1 selects the
+        // canonical UE layout.
+        const bool reordered = o.TUObjectArray.MaxElements || o.TUObjectArray.MaxChunks || o.TUObjectArray.NumChunks;
+        auto pick = [&](uintptr_t v) -> int32_t { return reordered ? static_cast<int32_t>(v) : -1; };
+        uobjArrayLayout.ObjObjectsOffset  = pick(o.FUObjectArray.ObjObjects);
+        uobjArrayLayout.ObjectsOffset     = pick(o.TUObjectArray.Objects);
+        uobjArrayLayout.MaxElementsOffset = pick(o.TUObjectArray.MaxElements);
+        uobjArrayLayout.NumElementsOffset = pick(o.TUObjectArray.NumElements);
+        uobjArrayLayout.MaxChunksOffset   = pick(o.TUObjectArray.MaxChunks);
+        uobjArrayLayout.NumChunksOffset   = pick(o.TUObjectArray.NumChunks);
+    }
+    // Layout guards, over every struct in the dump at once: a struct's base and the types
+    // of its members routinely live in other packages, and both decide whether its own
+    // offsets are checkable. Runs before any header is emitted, since it writes the asserts
+    // into each struct's Trailer. AIOHeader.hpp is already emitted by this point and stays
+    // assert-free — it is a browsing aid, not a compilation entry point.
+    const std::vector<UE_UPackage::Struct *> allStructs = CollectStructs(_sdkProcessed);
+    const sdkcoregen::CoreTypeSizes coreTypeSizes = sdkcoregen::ObserveCoreTypeSizes(allStructs);
+    const sdkcoregen::LayoutGuardStats guardStats =
+        sdkcoregen::AppendLayoutGuards(allStructs);
+    logsBufferFmt.append(
+        "SDK layout guards: {} structs / {} members checked; {} structs unchecked "
+        "(base overlap: {}, propagated: {})\n",
+        guardStats.CheckedStructs, guardStats.CheckedMembers, guardStats.SkippedStructs(),
+        guardStats.SkippedBaseOverlap, guardStats.SkippedPropagated);
+
+    EmitSDKCoreFiles(prefix, _sdkProcessed[coreIdx], _processEventIndex, fnameLayout, uobjArrayLayout, textLayout, coreTypeSizes, _sdkEnumUnderlying, structBaseChain, outBuffersMap);
+
+    size_t nonCorePkgCount = 0;
+    for (size_t pkgIdx : _sdkPkgOrder)
+    {
+        if (pkgIdx == coreIdx) continue;
+        auto &pkg = _sdkProcessed[pkgIdx];
+        const std::string fname = pkgPrefix + pkg.PackageName + ".hpp";
+        auto &buf = outBuffersMap[fname];
+
+        buf.append("#pragma once\n\n");
+        // pulls _structs.hpp + Basic.h + UnrealContainers.h transitively
+        buf.append("#include \"../CoreUObject_classes.hpp\"\n");
+
+        // Cross-pkg deps: struct FullDep -> #include; enum FullDep or any
+        // ForwardDep -> fwd-decl (enums always fwd-decl to avoid cycles).
+        std::set<std::string> depPkgs;
+        std::set<std::string> crossPkgFwdDecls;
+        auto recordFwdDecl = [&](const std::string &dep, size_t depPkgIdx) {
+            if (depPkgIdx == pkgIdx) return;            // same-pkg fwd block
+            if (depPkgIdx == coreIdx) return;            // pulled via CoreUObject_classes
+            crossPkgFwdDecls.insert(dep);
+        };
+        auto collect = [&](const UE_UPackage::Struct &s) {
+            for (const auto &dep : s.FullDeps)
+            {
+                auto it = _sdkNameToPkg.find(dep);
+                if (it == _sdkNameToPkg.end()) continue;
+                if (_sdkEnumUnderlying.count(dep))
+                {
+                    recordFwdDecl(dep, it->second);
+                    continue;
+                }
+                if (it->second == pkgIdx) continue;
+                if (it->second == coreIdx) continue;
+                depPkgs.insert(_sdkProcessed[it->second].PackageName);
+            }
+            for (const auto &dep : s.ForwardDeps)
+            {
+                auto it = _sdkNameToPkg.find(dep);
+                if (it == _sdkNameToPkg.end()) continue;
+                recordFwdDecl(dep, it->second);
+            }
+        };
+        for (const auto &s : pkg.Structures) collect(s);
+        for (const auto &c : pkg.Classes)    collect(c);
+        for (const auto &dp : depPkgs)
+            buf.append("#include \"{}.hpp\"\n", dp);
+        buf.append("\n");
+
+        buf.append("namespace SDK\n{{\n\n");
+        buf.append("// Package: {}\n// Enums: {}\n// Structs: {}\n// Classes: {}\n\n",
+                   pkg.PackageName, pkg.Enums.size(), pkg.Structures.size(), pkg.Classes.size());
+
+        // fwd-decls: same-pkg + cross-pkg ptr-only + cross-pkg enums
+        if (!pkg.Structures.empty() || !pkg.Classes.empty() || !crossPkgFwdDecls.empty())
+        {
+            for (const auto &n : crossPkgFwdDecls)
+            {
+                auto eit = _sdkEnumUnderlying.find(n);
+                if (eit != _sdkEnumUnderlying.end())
+                    buf.append("enum class {} : {};\n", n, eit->second);
+                else
+                    buf.append("struct {};\n", n);
+            }
+            for (const auto &s : pkg.Structures)
+                buf.append("struct {};\n", s.CppNameOnly);
+            for (const auto &c : pkg.Classes)
+                buf.append("struct {};\n", c.CppNameOnly);
+            buf.append("\n");
+        }
+
+        if (!pkg.Enums.empty())      UE_UPackage::AppendEnumsToBuffer(pkg.Enums, &buf);
+        if (!pkg.Structures.empty()) UE_UPackage::AppendStructsToBuffer(pkg.Structures, &buf);
+        if (!pkg.Classes.empty())    UE_UPackage::AppendStructsToBuffer(pkg.Classes, &buf);
+
+        buf.append("}} // namespace SDK\n");
+        ++nonCorePkgCount;
+
+        // <pkg>_functions.cpp: out-of-line bodies. Pulls every other non-core
+        // pkg referenced by a function signature, since those may be fwd-only
+        // in <pkg>.hpp.
+        const std::string fnFname = pkgPrefix + pkg.PackageName + "_functions.cpp";
+        auto &fbuf = outBuffersMap[fnFname];
+        fbuf.append("#include \"{}.hpp\"\n", pkg.PackageName);
+
+        std::set<std::string> fnDepPkgs;
+        auto collectFnDeps = [&](const UE_UPackage::Struct &s) {
+            for (const auto &f : s.Functions)
+            {
+                std::set<std::string> full, fwd;
+                UE_UPackage::ExtractTypeDeps(f.CppName, full, fwd);
+                UE_UPackage::ExtractTypeDeps(f.Params,  full, fwd);
+                for (const auto &set : { full, fwd })
+                {
+                    for (const auto &dep : set)
+                    {
+                        auto it = _sdkNameToPkg.find(dep);
+                        if (it == _sdkNameToPkg.end()) continue;
+                        if (it->second == pkgIdx) continue;
+                        if (it->second == coreIdx) continue;
+                        fnDepPkgs.insert(_sdkProcessed[it->second].PackageName);
+                    }
+                }
+            }
+        };
+        for (const auto &c : pkg.Classes) collectFnDeps(c);
+        for (const auto &dp : fnDepPkgs)
+            fbuf.append("#include \"{}.hpp\"\n", dp);
+        fbuf.append("#include <cstring> // memcpy for ArrayDim>1 param marshalling\n\n");
+        fbuf.append("namespace SDK\n{{\n\n");
+        EmitPackageFunctionBodies(fbuf, pkg, /*emitInline=*/false, _sdkEnumUnderlying);
+        fbuf.append("}} // namespace SDK\n");
+    }
+
+    {
+        auto &sdkBuf = outBuffersMap[prefix + "SDK.hpp"];
+        sdkBuf.append("#pragma once\n\n");
+        sdkBuf.append("// SDK.hpp - declaration aggregator.\n");
+        sdkBuf.append("// Compile/link Packages/*_functions.cpp + CoreUObject_functions.cpp + Basic.cpp.\n\n");
+        sdkBuf.append("#include \"CoreUObject_classes.hpp\"\n");
+        for (size_t pkgIdx : _sdkPkgOrder)
+        {
+            if (pkgIdx == coreIdx) continue;
+            const auto &pkg = _sdkProcessed[pkgIdx];
+            sdkBuf.append("#include \"Packages/{}.hpp\"\n", pkg.PackageName);
+        }
+    }
+
+    logsBufferFmt.append("SDK: emitted UECore companions + CoreUObject core files + {}Packages/ ({} pkgs x 2 files) + SDK.hpp\n",
+                         prefix, nonCorePkgCount);
     logsBufferFmt.append("==========================\n");
 }
