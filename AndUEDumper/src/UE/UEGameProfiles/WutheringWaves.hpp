@@ -21,7 +21,7 @@ public:
 
     std::vector<std::string> GetAppIDs() const override
     {
-        return {"com.kurogame.wutheringwaves.global"};
+        return {"com.kurogame.wutheringwaves.global", "com.kurogame.mingchao"};
     }
 
     bool isUsingCasePreservingName() const override
