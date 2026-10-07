@@ -254,6 +254,7 @@ done:
         if (!it.first.empty())
         {
             std::string path = KittyUtils::String::fmt("%s/%s", sDumpGameDir.c_str(), it.first.c_str());
+            IOUtils::mkdir_recursive(path.substr(0, path.find_last_of('/')), 0777);
             it.second.writeBufferToFile(path);
         }
     }
