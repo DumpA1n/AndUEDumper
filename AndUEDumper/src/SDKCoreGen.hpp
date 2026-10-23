@@ -31,6 +31,12 @@ struct UObjectArrayLayout
     int32_t ItemStride = 0x18;
     int32_t ObjectOffset = 0;
     int32_t NumElementsPerChunk = 0x10000;
+    // SerialNumber within a 0x18 FUObjectItem whose Object is at 0. -1 = canonical 0x10.
+    // A moved SerialNumber leaves ClusterRootIndex unplaced, so 0xC up to it is padding.
+    int32_t SerialNumberOffset = -1;
+    // EInternalObjectFlags bits in the item's flags word; 0 = unknown, never reported set.
+    uint32_t UnreachableFlag = 0;
+    uint32_t PendingKillFlag = 0;
     // FUObjectArray / TUObjectArray field offsets, so the emitted struct OVERLAYS the
     // live (possibly reordered) game memory directly — no host-side synthetic remap.
     // -1 = use the canonical UE offset (output unchanged for non-reordered games).
@@ -389,30 +395,49 @@ inline std::string GenUObjectArray(const UObjectArrayLayout& L)
     const int32_t nepc    = chunked ? L.NumElementsPerChunk : (64 * 1024);
 
     // FUObjectItem differs by UE version (derived from probed stride / Object offset).
+    // flagsField names the int32 that carries EInternalObjectFlags, serialOff places
+    // SerialNumber; either stays empty / -1 when the layout does not pin it down.
     std::string item = "struct FUObjectItem\n{\n";
+    std::string flagsField;
+    int32_t serialOff = -1;
     if (objOff == 8)  // UE5.7+: int64 FlagsAndRefCount @0, Object @8
     {
         item += "\tint64 FlagsAndRefCount;\n";
         item += "\tclass UObject* Object;\n";
         item += "\tint32 SerialNumber;\n";
         item += "\tint32 ClusterRootIndex;\n";
+        serialOff = 0x10;
     }
     else if (objOff == 0 && stride == 0x10)  // UE4.11-4.21: flags+cluster fused
     {
         item += "\tclass UObject* Object;\n";
         item += "\tint32 ClusterAndFlags;\n";
         item += "\tint32 SerialNumber;\n";
+        flagsField = "ClusterAndFlags";
+        serialOff = 0xC;
     }
     else if (objOff == 0 && stride == 0x18)  // UE4.22-5.6
     {
+        serialOff = L.SerialNumberOffset >= 0 ? L.SerialNumberOffset : 0x10;
         item += "\t// Pointer to the allocated object\n";
         item += "\tclass UObject* Object;\n";
         item += "\t// Internal flags\n";
         item += "\tint32 Flags;\n";
-        item += "\t// UObject Owner Cluster Index\n";
-        item += "\tint32 ClusterRootIndex;\n";
+        if (serialOff == 0x10)
+        {
+            item += "\t// UObject Owner Cluster Index\n";
+            item += "\tint32 ClusterRootIndex;\n";
+        }
+        else if (serialOff > 0xC)
+        {
+            item += "\tuint8 _pad_flags[" + hx(serialOff - 0xC) + "];\n";
+        }
         item += "\t// Weak Object Pointer Serial number associated with the object\n";
         item += "\tint32 SerialNumber;\n";
+        const int32_t tail = stride - serialOff - 4;
+        if (serialOff != 0x10 && tail > 0)
+            item += "\tuint8 _pad_serial[" + hx(tail) + "];\n";
+        flagsField = "Flags";
     }
     else  // generic: pad to the probed stride
     {
@@ -423,6 +448,19 @@ inline std::string GenUObjectArray(const UObjectArrayLayout& L)
         if (tail > 0)
             item += "\tuint8 _pad_obj[" + hx(tail) + "];\n";
     }
+
+    // UE's FUObjectItem accessors. Without a SerialNumber the weak pointer resolves by
+    // index alone; without a flag bit the item never reads as unreachable or pending kill.
+    auto flagTest = [&](uint32_t bit) {
+        return flagsField.empty() || bit == 0
+                   ? std::string("false")
+                   : "(" + flagsField + " & " + hx(static_cast<int32_t>(bit)) + ") != 0";
+    };
+    item += "\n";
+    item += std::string("\tstatic constexpr bool bHasSerialNumber = ") + (serialOff >= 0 ? "true" : "false") + ";\n";
+    item += std::string("\tinline int32 GetSerialNumber() const { return ") + (serialOff >= 0 ? "SerialNumber" : "0") + "; }\n";
+    item += "\tinline bool IsUnreachable() const { return " + flagTest(L.UnreachableFlag) + "; }\n";
+    item += "\tinline bool IsPendingKill() const { return " + flagTest(L.PendingKillFlag) + "; }\n";
     item += "};\n";
 
     const std::string nepcStr = (nepc == 64 * 1024) ? "64 * 1024" : std::to_string(nepc);
@@ -470,7 +508,12 @@ inline std::string GenUObjectArray(const UObjectArrayLayout& L)
     // check/checkf/etc. come from "UEAssert.h" (included by Basic.h ahead of this block).
     s += item;
     s += "static_assert(sizeof(FUObjectItem) == " + hx(stride) + ", \"FUObjectItem stride mismatch vs dumped size — re-dump SDK\");\n";
-    s += "static_assert(offsetof(FUObjectItem, Object) == " + hx(objOff) + ", \"FUObjectItem::Object has a wrong offset!\");\n\n";
+    s += "static_assert(offsetof(FUObjectItem, Object) == " + hx(objOff) + ", \"FUObjectItem::Object has a wrong offset!\");\n";
+    if (!flagsField.empty())
+        s += "static_assert(offsetof(FUObjectItem, " + flagsField + ") == 0x8, \"FUObjectItem::" + flagsField + " has a wrong offset!\");\n";
+    if (serialOff >= 0)
+        s += "static_assert(offsetof(FUObjectItem, SerialNumber) == " + hx(serialOff) + ", \"FUObjectItem::SerialNumber has a wrong offset!\");\n";
+    s += "\n";
 
     s += "class FFixedUObjectArray\n{\npublic:\n";
     s += fixedFields;
@@ -609,6 +652,14 @@ public:
 		if (!ObjObjects.IsValidIndex(Index))
 			return nullptr;
 		return ObjObjects.GetObjectPtr(Index);
+	}
+
+	inline bool IsValid(const FUObjectItem* ObjectItem, bool bEvenIfPendingKill) const
+	{
+		if (!ObjectItem)
+			return false;
+		return bEvenIfPendingKill ? !ObjectItem->IsUnreachable()
+		                          : !(ObjectItem->IsUnreachable() || ObjectItem->IsPendingKill());
 	}
 
 	// Convenience iterator (not UE source). Callback returns true to stop early.

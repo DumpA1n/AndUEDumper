@@ -68,6 +68,12 @@ struct UE_Offsets
     {
         uintptr_t Object = 0;
         uintptr_t Size = 0;
+        // 0 selects the UE layout implied by Object and Size; set when a build moves it.
+        uintptr_t SerialNumber = 0;
+        // EInternalObjectFlags bits FUObjectItem::Flags carries for GC state. 0 means the
+        // bit is unknown for the engine version, and the SDK then never reports it set.
+        uintptr_t UnreachableFlag = 0;
+        uintptr_t PendingKillFlag = 0;
     } FUObjectItem;
     struct
     {

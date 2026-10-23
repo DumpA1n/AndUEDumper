@@ -1763,6 +1763,9 @@ void UEDumper::DumpSDK_PerPackage(BufferFmt &logsBufferFmt, std::unordered_map<s
             textLayout.GetDisplayStringIndex = static_cast<int32_t>(o.FTextData.GetDisplayString);
         uobjArrayLayout.ItemStride = o.FUObjectItem.Size ? static_cast<int32_t>(o.FUObjectItem.Size) : 0x18;
         uobjArrayLayout.ObjectOffset = static_cast<int32_t>(o.FUObjectItem.Object);
+        uobjArrayLayout.SerialNumberOffset = o.FUObjectItem.SerialNumber ? static_cast<int32_t>(o.FUObjectItem.SerialNumber) : -1;
+        uobjArrayLayout.UnreachableFlag = static_cast<uint32_t>(o.FUObjectItem.UnreachableFlag);
+        uobjArrayLayout.PendingKillFlag = static_cast<uint32_t>(o.FUObjectItem.PendingKillFlag);
         uobjArrayLayout.NumElementsPerChunk = static_cast<int32_t>(o.TUObjectArray.NumElementsPerChunk);
         // A profile with a reordered object array sets MaxElements/MaxChunks/NumChunks, and
         // then every count offset is taken as given (0 included). Otherwise -1 selects the

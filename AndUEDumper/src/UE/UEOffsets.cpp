@@ -95,6 +95,9 @@ std::string UE_Offsets::ToString() const
         {
             kOUT_NS_MEMBER_P(FUObjectItem, Object);
             kOUT_NS_MEMBER_P(FUObjectItem, Size);
+            kOUT_NS_MEMBER_P(FUObjectItem, SerialNumber);
+            kOUT_NS_MEMBER_P(FUObjectItem, UnreachableFlag);
+            kOUT_NS_MEMBER_P(FUObjectItem, PendingKillFlag);
             kOUT_NS_END();
             kOUT_NEWLINE();
             kOUT_NEWLINE();
@@ -474,6 +477,8 @@ namespace UE_DefaultOffsets
 
             offsets.FUObjectItem.Object = 0;
             offsets.FUObjectItem.Size = GetPtrAlignedOf(sizeof(void *) + (sizeof(int32_t) * 3));
+            offsets.FUObjectItem.UnreachableFlag = 1 << 28;
+            offsets.FUObjectItem.PendingKillFlag = 1 << 29;
 
             offsets.UObject.ObjectFlags = sizeof(void *);
             offsets.UObject.InternalIndex = offsets.UObject.ObjectFlags + sizeof(int32_t);

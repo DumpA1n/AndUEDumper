@@ -378,11 +378,18 @@ public:
 
 public:
 	class UObject* Get() const;
+	class UObject* Get(bool bEvenIfPendingKill) const;
 	class UObject* operator->() const;
+	bool IsValid(bool bEvenIfPendingKill, bool bThreadsafeTest = false) const;
+	bool IsValid() const;
 	bool operator==(const FWeakObjectPtr& Other) const;
 	bool operator!=(const FWeakObjectPtr& Other) const;
 	bool operator==(const class UObject* Other) const;
 	bool operator!=(const class UObject* Other) const;
+
+private:
+	bool SerialNumbersMatch(const FUObjectItem* ObjectItem) const;
+	FUObjectItem* Internal_GetObjectItem() const;
 };
 
 template<typename UEType>
@@ -1057,11 +1064,44 @@ UFunction* BasicFilesImpleUtils::FindFunctionByFName(const FName* Name)
 
 
 // Predefined Function
+// FWeakObjectPtr as UE implements it: the slot must still hold the same instance (serial
+// number) and, unless asked otherwise, an object the GC has not condemned.
+
+bool FWeakObjectPtr::SerialNumbersMatch(const FUObjectItem* ObjectItem) const
+{
+	return !FUObjectItem::bHasSerialNumber || ObjectItem->GetSerialNumber() == ObjectSerialNumber;
+}
+
+
+// Predefined Function
+
+FUObjectItem* FWeakObjectPtr::Internal_GetObjectItem() const
+{
+	if (FUObjectItem::bHasSerialNumber && ObjectSerialNumber == 0)
+		return nullptr;
+	if (ObjectIndex < 0 || !GUObjectArray)
+		return nullptr;
+	FUObjectItem* ObjectItem = GUObjectArray->IndexToObject(ObjectIndex);
+	if (!ObjectItem || !SerialNumbersMatch(ObjectItem))
+		return nullptr;
+	return ObjectItem;
+}
+
+
+// Predefined Function
+
+class UObject* FWeakObjectPtr::Get(bool bEvenIfPendingKill) const
+{
+	FUObjectItem* ObjectItem = Internal_GetObjectItem();
+	return ObjectItem && GUObjectArray->IsValid(ObjectItem, bEvenIfPendingKill) ? ObjectItem->Object : nullptr;
+}
+
+
+// Predefined Function
 
 class UObject* FWeakObjectPtr::Get() const
 {
-	FUObjectItem* Item = GUObjectArray->IndexToObject(ObjectIndex);
-	return Item ? Item->Object : nullptr;
+	return Get(false);
 }
 
 
@@ -1069,8 +1109,26 @@ class UObject* FWeakObjectPtr::Get() const
 
 class UObject* FWeakObjectPtr::operator->() const
 {
-	FUObjectItem* Item = GUObjectArray->IndexToObject(ObjectIndex);
-	return Item ? Item->Object : nullptr;
+	return Get(false);
+}
+
+
+// Predefined Function
+
+bool FWeakObjectPtr::IsValid(bool bEvenIfPendingKill, bool bThreadsafeTest) const
+{
+	FUObjectItem* ObjectItem = Internal_GetObjectItem();
+	if (bThreadsafeTest)
+		return ObjectItem != nullptr;
+	return ObjectItem && GUObjectArray->IsValid(ObjectItem, bEvenIfPendingKill);
+}
+
+
+// Predefined Function
+
+bool FWeakObjectPtr::IsValid() const
+{
+	return IsValid(false, false);
 }
 
 
@@ -1078,7 +1136,8 @@ class UObject* FWeakObjectPtr::operator->() const
 
 bool FWeakObjectPtr::operator==(const FWeakObjectPtr& Other) const
 {
-	return ObjectIndex == Other.ObjectIndex;
+	return (ObjectIndex == Other.ObjectIndex && ObjectSerialNumber == Other.ObjectSerialNumber) ||
+	       (!IsValid() && !Other.IsValid());
 }
 
 
@@ -1086,7 +1145,7 @@ bool FWeakObjectPtr::operator==(const FWeakObjectPtr& Other) const
 
 bool FWeakObjectPtr::operator!=(const FWeakObjectPtr& Other) const
 {
-	return ObjectIndex != Other.ObjectIndex;
+	return !(*this == Other);
 }
 
 
@@ -1094,7 +1153,7 @@ bool FWeakObjectPtr::operator!=(const FWeakObjectPtr& Other) const
 
 bool FWeakObjectPtr::operator==(const class UObject* Other) const
 {
-	return ObjectIndex == Other->InternalIndex;
+	return Get() == Other;
 }
 
 
@@ -1102,7 +1161,7 @@ bool FWeakObjectPtr::operator==(const class UObject* Other) const
 
 bool FWeakObjectPtr::operator!=(const class UObject* Other) const
 {
-	return ObjectIndex != Other->InternalIndex;
+	return Get() != Other;
 }
 
 }
