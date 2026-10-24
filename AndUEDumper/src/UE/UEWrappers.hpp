@@ -810,6 +810,9 @@ public:
         return Base(object);
     }
     std::string GetName() const;
+    UE_FFieldClass GetSuperClass() const;
+    // Bytes ConstructFn allocates for one instance; 0 when its allocation cannot be decoded.
+    uint32_t GetInstanceSize() const;
 };
 
 class UE_FField
@@ -922,10 +925,11 @@ public:
     std::string GetTypeStr() const;
 };
 
-class UE_FSoftClassProperty : public UE_FClassProperty
+class UE_FSoftClassProperty : public UE_FObjectPropertyBase
 {
 public:
-    using UE_FClassProperty::UE_FClassProperty;
+    using UE_FObjectPropertyBase::UE_FObjectPropertyBase;
+    UE_UClass GetMetaClass() const;
     std::string GetTypeStr() const;
 };
 
@@ -958,7 +962,7 @@ class UE_FFieldPathProperty : public UE_FProperty
 {
 public:
     using UE_FProperty::UE_FProperty;
-    UE_FName GetPropertyName() const;
+    UE_FFieldClass GetPropertyClass() const;
     std::string GetTypeStr() const;
 };
 

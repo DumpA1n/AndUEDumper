@@ -68,13 +68,15 @@ private:
 
     void GatherUObjects(BufferFmt &logsBufferFmt, BufferFmt &objsBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback);
 
-    void BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback);
+    void BuildProcessedPackages(BufferFmt &logsBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback);
 
     // Inject empty Struct entries for non-UObject reflection metadata types
-    // (FField / FFieldClass / FProperty + 13 FProperty subclasses) into CoreUObject
-    // package. Members stay empty here; augment() fills them via fieldsFor().
-    // Runs after dropDups but before augment.
-    void SynthesizeReflectionTypes();
+    // (FFieldClass, FField, FProperty, the FProperty subclasses the dumped structs use
+    // and the container layouts) into the CoreUObject package. Members stay empty here;
+    // augment() fills them via fieldsFor(). Runs after dropDups but before augment.
+    // Returns the allocation size the engine constructs each property subclass with,
+    // for the subclasses whose size could be decoded.
+    std::unordered_map<std::string, uint32_t> SynthesizeReflectionTypes(BufferFmt &logsBufferFmt, const UEPackagesArray &packages);
 
     void DumpAIOHeader(BufferFmt &logsBufferFmt, BufferFmt &aioBufferFmt);
 

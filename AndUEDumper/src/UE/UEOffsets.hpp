@@ -135,6 +135,9 @@ struct UE_Offsets
         uintptr_t CastFlags = 0;
         uintptr_t ClassFlags = 0;
         uintptr_t SuperClass = 0;
+        // FField* (*)(const FFieldVariant&, const FName&, EObjectFlags), which allocates
+        // and constructs one instance of the class. 0 when unknown.
+        uintptr_t ConstructFn = 0;
         uintptr_t Size = 0;
     } FFieldClass;
     struct
@@ -144,11 +147,52 @@ struct UE_Offsets
         uintptr_t PropertyFlags = 0;
         uintptr_t Offset_Internal = 0;
         uintptr_t Size = 0;
-        // Offset of the first member FProperty subclasses declare, such as
-        // FObjectPropertyBase::PropertyClass. Stock layouts place it at Size;
-        // some builds insert metadata in between.
-        uintptr_t SubPropertyBase = 0;
     } FProperty;
+    // The first member each FProperty subclass declares. Stock layouts place it at
+    // FProperty.Size; some builds insert members in front of it in individual
+    // subclasses, so each is located on its own.
+    struct
+    {
+        uintptr_t Struct = 0;  // pointer to UScriptStruct
+    } FStructProperty;
+    struct
+    {
+        uintptr_t PropertyClass = 0;  // pointer to UClass
+    } FObjectPropertyBase;
+    struct
+    {
+        uintptr_t MetaClass = 0;  // pointer to UClass
+    } FClassProperty;
+    // FSoftClassProperty derives from FSoftObjectProperty, not FClassProperty.
+    struct
+    {
+        uintptr_t MetaClass = 0;  // pointer to UClass
+    } FSoftClassProperty;
+    struct
+    {
+        uintptr_t Enum = 0;  // pointer to UEnum
+    } FByteProperty;
+    struct
+    {
+        uintptr_t InterfaceClass = 0;  // pointer to UClass
+    } FInterfaceProperty;
+    struct
+    {
+        uintptr_t PropertyClass = 0;  // pointer to FFieldClass
+    } FFieldPathProperty;
+    struct
+    {
+        uintptr_t SignatureFunction = 0;  // pointer to UFunction
+    } FDelegateProperty;
+    // Shared by FMulticastInlineDelegateProperty and FMulticastSparseDelegateProperty.
+    struct
+    {
+        uintptr_t SignatureFunction = 0;  // pointer to UFunction
+    } FMulticastDelegateProperty;
+    struct
+    {
+        uintptr_t ValueProperty = 0;  // pointer to FProperty
+    } FOptionalProperty;
     // FBoolProperty declares FieldSize, ByteOffset, ByteMask and FieldMask as
     // consecutive uint8 members, so FieldSize locates all four. Stock layouts put
     // FieldSize at FProperty.Size.
@@ -172,8 +216,8 @@ struct UE_Offsets
         uintptr_t UnderlyingType = 0;  // pointer to FProperty
         uintptr_t Enum = 0;            // pointer to UEnum
     } FEnumProperty;
-    // Container inner properties. Stock layouts place them at SubPropertyBase;
-    // builds that pad individual subclasses move them independently.
+    // Container inner properties. FSetProperty::SetLayout follows ElementProp and
+    // FMapProperty::MapLayout follows ValueProp.
     struct
     {
         uintptr_t Inner = 0;  // pointer to FProperty

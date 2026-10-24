@@ -1097,6 +1097,35 @@ std::string UE_FFieldClass::GetName() const
     return name.GetName();
 }
 
+UE_FFieldClass UE_FFieldClass::GetSuperClass() const
+{
+    return vm_rpm_ptr<UE_FFieldClass>(object + UEWrappers::GetOffsets()->FFieldClass.SuperClass);
+}
+
+// The Construct function DECLARE_FIELD generates for the class allocates the instance
+// with its first call: GMalloc's Malloc through the vtable takes the size in w1, operator
+// new and FMemory::Malloc take it in w0. Compilers load the constant with MOVZ.
+uint32_t UE_FFieldClass::GetInstanceSize() const
+{
+    const uintptr_t constructFn = UEWrappers::GetOffsets()->FFieldClass.ConstructFn;
+    auto pc = object && constructFn ? vm_rpm_ptr<uint8_t *>(object + constructFn) : nullptr;
+    uint64_t moved[2] = {};  // last MOVZ into x0 and x1
+    for (int i = 0; pc && i < 64; ++i, pc += sizeof(uint32_t))
+    {
+        const uint32_t insn = vm_rpm_ptr<uint32_t>(pc);
+        const uint32_t rd = insn & 0x1F;
+        if ((insn & 0x7F800000) == 0x52800000 && rd < 2)  // MOVZ
+            moved[rd] = uint64_t((insn >> 5) & 0xFFFF) << (((insn >> 21) & 3) * 16);
+        const bool bl = (insn & 0xFC000000) == 0x94000000, blr = (insn & 0xFFFFFC1F) == 0xD63F0000;
+        if (bl || blr)
+        {
+            const uint64_t size = moved[blr ? 1 : 0];
+            return size && size <= 0x1000 && size % sizeof(void *) == 0 ? uint32_t(size) : 0;
+        }
+    }
+    return 0;
+}
+
 UE_FField UE_FField::GetNext() const
 {
     return vm_rpm_ptr<UE_FField>(object + UEWrappers::GetOffsets()->FField.Next);
@@ -1275,14 +1304,14 @@ UEPropTypeInfo UE_FProperty::GetType() const
     }
     case HASH("WeakObjectProperty"):
     {
-        auto obj = this->Cast<UE_FStructProperty>();
-        type = {UEPropertyType::WeakObjectProperty, "struct TWeakObjectPtr<" + obj.GetTypeStr() + ">"};
+        auto obj = this->Cast<UE_FObjectPropertyBase>();
+        type = {UEPropertyType::WeakObjectProperty, "struct TWeakObjectPtr<struct " + obj.GetPropertyClass().GetCppName() + ">"};
         break;
     }
     case HASH("LazyObjectProperty"):
     {
-        auto obj = this->Cast<UE_FStructProperty>();
-        type = {UEPropertyType::LazyObjectProperty, "struct TLazyObjectPtr<" + obj.GetTypeStr() + ">"};
+        auto obj = this->Cast<UE_FObjectPropertyBase>();
+        type = {UEPropertyType::LazyObjectProperty, "struct TLazyObjectPtr<struct " + obj.GetPropertyClass().GetCppName() + ">"};
         break;
     }
     case HASH("StrProperty"):
@@ -1360,7 +1389,7 @@ IFProperty UE_FProperty::GetInterface() const { return IFProperty(this); }
 
 UE_UStruct UE_FStructProperty::GetStruct() const
 {
-    return vm_rpm_ptr<UE_UStruct>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
+    return vm_rpm_ptr<UE_UStruct>(object + UEWrappers::GetOffsets()->FStructProperty.Struct);
 }
 
 std::string UE_FStructProperty::GetTypeStr() const
@@ -1370,7 +1399,7 @@ std::string UE_FStructProperty::GetTypeStr() const
 
 UE_UClass UE_FObjectPropertyBase::GetPropertyClass() const
 {
-    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FObjectPropertyBase.PropertyClass);
 }
 
 std::string UE_FObjectPropertyBase::GetTypeStr() const
@@ -1390,7 +1419,7 @@ std::string UE_FArrayProperty::GetTypeStr() const
 
 UE_UEnum UE_FByteProperty::GetEnum() const
 {
-    auto e = vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
+    auto e = vm_rpm_ptr<UE_UEnum>(object + UEWrappers::GetOffsets()->FByteProperty.Enum);
     return (e && e.IsA<UE_UEnum>()) ? e : nullptr;
 }
 
@@ -1459,12 +1488,17 @@ std::string UE_FEnumProperty::GetTypeStr() const
 
 UE_UClass UE_FClassProperty::GetMetaClass() const
 {
-    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase + sizeof(void *));
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FClassProperty.MetaClass);
 }
 
 std::string UE_FClassProperty::GetTypeStr() const
 {
     return "struct " + GetMetaClass().GetCppName() + "*";
+}
+
+UE_UClass UE_FSoftClassProperty::GetMetaClass() const
+{
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FSoftClassProperty.MetaClass);
 }
 
 std::string UE_FSoftClassProperty::GetTypeStr() const
@@ -1500,7 +1534,7 @@ std::string UE_FMapProperty::GetTypeStr() const
 
 UE_UClass UE_FInterfaceProperty::GetInterfaceClass() const
 {
-    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FProperty.SubPropertyBase);
+    return vm_rpm_ptr<UE_UClass>(object + UEWrappers::GetOffsets()->FInterfaceProperty.InterfaceClass);
 }
 
 std::string UE_FInterfaceProperty::GetTypeStr() const
@@ -1508,12 +1542,12 @@ std::string UE_FInterfaceProperty::GetTypeStr() const
     return "struct TScriptInterface<I" + GetInterfaceClass().GetName() + ">";
 }
 
-UE_FName UE_FFieldPathProperty::GetPropertyName() const
+UE_FFieldClass UE_FFieldPathProperty::GetPropertyClass() const
 {
-    return vm_rpm_ptr<UE_FName>(object + UEWrappers::GetOffsets()->FProperty.Size);
+    return vm_rpm_ptr<UE_FFieldClass>(object + UEWrappers::GetOffsets()->FFieldPathProperty.PropertyClass);
 }
 
 std::string UE_FFieldPathProperty::GetTypeStr() const
 {
-    return "struct TFieldPath<F" + GetPropertyName().GetName() + ">";
+    return "struct TFieldPath<F" + GetPropertyClass().GetName() + ">";
 }

@@ -118,7 +118,7 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
         return false;
     }
 
-    BuildProcessedPackages(packages, _dumpProgressCallback);
+    BuildProcessedPackages(logsBufferFmt, packages, _dumpProgressCallback);
 
     // Rewrites declarations, so it precedes every header, AIOHeader.hpp included.
     const sdkcoregen::TailPaddingStats tailStats =
@@ -390,8 +390,10 @@ static std::vector<Node> TopoSort(const std::vector<Node> &nodes, DepsFn getDeps
     return out;
 }
 
-void UEDumper::SynthesizeReflectionTypes()
+std::unordered_map<std::string, uint32_t> UEDumper::SynthesizeReflectionTypes(BufferFmt &logsBufferFmt, const UEPackagesArray &packages)
 {
+    std::unordered_map<std::string, uint32_t> allocated;
+
     // Find CoreUObject package; refuse to synthesize anywhere else.
     UE_UPackage *corePkg = nullptr;
     for (auto &p : _sdkProcessed)
@@ -402,62 +404,98 @@ void UEDumper::SynthesizeReflectionTypes()
             break;
         }
     }
-    if (!corePkg) return;
+    if (!corePkg) return allocated;
 
     const UE_Offsets &offs = *_profile->GetUEVars()->GetOffsets();
 
     // FField / FProperty layout only exists from UE 4.25+. If the profile
     // didn't initialize FProperty.Size, this build has no FField at all.
-    if (offs.FProperty.Size == 0) return;
+    if (offs.FProperty.Size == 0) return allocated;
 
-    // Size table — needs to mirror §4.3 of docs/architecture/reflection-emit.md.
-    // Computed in topological order so child sizes can refer to parent sizes.
+    // Property classes the dumped structs declare members with, and their ancestors.
+    std::unordered_map<std::string, UE_FFieldClass> used;
+    for (const auto &pkg : packages)
+    {
+        for (const auto &object : pkg.second)
+        {
+            if (!object.IsA<UE_UStruct>()) continue;
+            for (auto field = object.Cast<UE_UStruct>().GetChildProperties(); field; field = field.GetNext())
+            {
+                const auto fieldClass = field.GetClass();
+                used.emplace(fieldClass.GetName(), fieldClass);
+            }
+        }
+    }
+    std::unordered_set<std::string> present;
+    for (const auto &[name, fieldClass] : used)
+    {
+        auto c = fieldClass;
+        for (int depth = 0; c && depth < 16 && present.insert(c.GetName()).second; ++depth)
+            c = c.GetSuperClass();
+    }
+
+    // The extent of the members each type declares; augment() places them. A type
+    // ends no earlier than its parent.
     std::unordered_map<std::string, uint32_t> sizeOf;
     auto align8 = [](uintptr_t v) -> uint32_t {
         return static_cast<uint32_t>((v + 7) & ~uintptr_t(7));
     };
-    sizeOf["FFieldClass"]         = static_cast<uint32_t>(offs.FFieldClass.Size);
-    sizeOf["FField"]              = align8(offs.FField.FlagsPrivate + sizeof(int32_t));
-    sizeOf["FProperty"]           = static_cast<uint32_t>(offs.FProperty.Size);
-    sizeOf["FStructProperty"]     = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FObjectPropertyBase"] = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FClassProperty"]      = sizeOf["FObjectPropertyBase"] + sizeof(void *);
-    sizeOf["FSoftClassProperty"]  = sizeOf["FClassProperty"];
-    sizeOf["FArrayProperty"]      = static_cast<uint32_t>(offs.FArrayProperty.Inner + sizeof(void *));
-    sizeOf["FByteProperty"]       = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FBoolProperty"]       = align8(offs.FBoolProperty.FieldSize + 4);
-    sizeOf["FEnumProperty"]       = static_cast<uint32_t>(
-        std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum) + sizeof(void *));
-    sizeOf["FSetProperty"]        = static_cast<uint32_t>(offs.FSetProperty.ElementProp + sizeof(void *));
-    sizeOf["FMapProperty"]        = static_cast<uint32_t>(offs.FMapProperty.ValueProp + sizeof(void *));
-    sizeOf["FInterfaceProperty"]  = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FFieldPathProperty"]  = static_cast<uint32_t>(offs.FProperty.Size + offs.FName.Size);
-    sizeOf["FDelegateProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
-    sizeOf["FOptionalProperty"]   = static_cast<uint32_t>(offs.FProperty.SubPropertyBase + sizeof(void *));
+    auto pointerAt = [](uintptr_t off) { return static_cast<uint32_t>(off + sizeof(void *)); };
+    constexpr uint32_t kSetLayoutSize = 0x14, kMapLayoutSize = 0x18;
+    sizeOf["FFieldClass"]                = static_cast<uint32_t>(offs.FFieldClass.Size);
+    sizeOf["FField"]                     = align8(offs.FField.FlagsPrivate + sizeof(int32_t));
+    sizeOf["FProperty"]                  = static_cast<uint32_t>(offs.FProperty.Size);
+    sizeOf["FScriptSparseArrayLayout"]   = 0x8;
+    sizeOf["FScriptSetLayout"]           = kSetLayoutSize;
+    sizeOf["FScriptMapLayout"]           = kMapLayoutSize;
+    sizeOf["FStructProperty"]            = pointerAt(offs.FStructProperty.Struct);
+    sizeOf["FObjectPropertyBase"]        = pointerAt(offs.FObjectPropertyBase.PropertyClass);
+    sizeOf["FClassProperty"]             = pointerAt(offs.FClassProperty.MetaClass);
+    sizeOf["FSoftClassProperty"]         = pointerAt(offs.FSoftClassProperty.MetaClass);
+    sizeOf["FArrayProperty"]             = pointerAt(offs.FArrayProperty.Inner);
+    sizeOf["FByteProperty"]              = pointerAt(offs.FByteProperty.Enum);
+    sizeOf["FBoolProperty"]              = align8(offs.FBoolProperty.FieldSize + 4);
+    sizeOf["FEnumProperty"]              = pointerAt(std::max(offs.FEnumProperty.UnderlyingType, offs.FEnumProperty.Enum));
+    sizeOf["FSetProperty"]               = align8(pointerAt(offs.FSetProperty.ElementProp) + kSetLayoutSize);
+    sizeOf["FMapProperty"]               = align8(pointerAt(offs.FMapProperty.ValueProp) + kMapLayoutSize);
+    sizeOf["FInterfaceProperty"]         = pointerAt(offs.FInterfaceProperty.InterfaceClass);
+    sizeOf["FFieldPathProperty"]         = pointerAt(offs.FFieldPathProperty.PropertyClass);
+    sizeOf["FDelegateProperty"]          = pointerAt(offs.FDelegateProperty.SignatureFunction);
+    sizeOf["FMulticastDelegateProperty"] = pointerAt(offs.FMulticastDelegateProperty.SignatureFunction);
+    sizeOf["FOptionalProperty"]          = pointerAt(offs.FOptionalProperty.ValueProperty);
 
+    // Parents precede their subclasses.
     struct ReflectionType { const char *cppName; const char *parent; };
     static constexpr ReflectionType kReflectionTypes[] = {
         // FField hierarchy
-        { "FFieldClass",         "" },
-        { "FField",              "" },
+        { "FFieldClass",                      "" },
+        { "FField",                           "" },
         // FProperty : FField. FProperty's Inherited is FField's data extent; see below.
-        { "FProperty",           "FField" },
+        { "FProperty",                        "FField" },
+        // the layouts FSetProperty and FMapProperty embed
+        { "FScriptSparseArrayLayout",         "" },
+        { "FScriptSetLayout",                 "" },
+        { "FScriptMapLayout",                 "" },
         // direct FProperty subclasses
-        { "FStructProperty",     "FProperty" },
-        { "FObjectPropertyBase", "FProperty" },
-        { "FArrayProperty",      "FProperty" },
-        { "FByteProperty",       "FProperty" },
-        { "FBoolProperty",       "FProperty" },
-        { "FEnumProperty",       "FProperty" },
-        { "FSetProperty",        "FProperty" },
-        { "FMapProperty",        "FProperty" },
-        { "FInterfaceProperty",  "FProperty" },
-        { "FFieldPathProperty",  "FProperty" },
-        { "FDelegateProperty",   "FProperty" },
-        { "FOptionalProperty",   "FProperty" },
-        // indirect (FObjectPropertyBase / FClassProperty)
-        { "FClassProperty",      "FObjectPropertyBase" },
-        { "FSoftClassProperty",  "FClassProperty" },
+        { "FStructProperty",                  "FProperty" },
+        { "FObjectPropertyBase",              "FProperty" },
+        { "FArrayProperty",                   "FProperty" },
+        { "FByteProperty",                    "FProperty" },
+        { "FBoolProperty",                    "FProperty" },
+        { "FEnumProperty",                    "FProperty" },
+        { "FSetProperty",                     "FProperty" },
+        { "FMapProperty",                     "FProperty" },
+        { "FInterfaceProperty",               "FProperty" },
+        { "FFieldPathProperty",               "FProperty" },
+        { "FDelegateProperty",                "FProperty" },
+        { "FMulticastDelegateProperty",       "FProperty" },
+        { "FOptionalProperty",                "FProperty" },
+        // indirect
+        { "FClassProperty",                   "FObjectPropertyBase" },
+        { "FSoftObjectProperty",              "FObjectPropertyBase" },
+        { "FSoftClassProperty",               "FSoftObjectProperty" },
+        { "FMulticastInlineDelegateProperty", "FMulticastDelegateProperty" },
+        { "FMulticastSparseDelegateProperty", "FMulticastDelegateProperty" },
     };
 
     // Build a set of existing CppNameOnly in CoreUObject Structures to avoid dup insert.
@@ -467,32 +505,55 @@ void UEDumper::SynthesizeReflectionTypes()
 
     for (const auto &t : kReflectionTypes)
     {
-        if (existing.count(t.cppName)) continue;
+        const std::string cppName = t.cppName;
+        const std::string parent = t.parent;
+        // A property subclass the build never uses, such as FOptionalProperty before UE 5,
+        // has no layout to describe.
+        const bool propertySubclass = !parent.empty() && parent != "FField";
+        if (existing.count(cppName) || (propertySubclass && !present.count(cppName.substr(1)))) continue;
+
+        uint32_t size = sizeOf[cppName];
+        if (!parent.empty()) size = std::max(size, sizeOf[parent]);
+        // The engine allocates exactly sizeof(T) for each instance: a member past it is
+        // misplaced, and bytes beyond the known members belong to members reflection
+        // does not name.
+        if (const auto it = used.find(cppName.substr(1)); propertySubclass && it != used.end())
+        {
+            if (const uint32_t allocation = it->second.GetInstanceSize())
+            {
+                allocated[cppName] = allocation;
+                size = std::max(size, allocation);
+            }
+            else
+            {
+                logsBufferFmt.append("Warning: {}'s allocation size could not be decoded from its ConstructFn; its size is unchecked\n", cppName);
+            }
+        }
+        sizeOf[cppName] = size;
 
         UE_UPackage::Struct s;
-        s.Name         = t.cppName;
-        s.FullName     = std::string("ScriptStruct CoreUObject.") + t.cppName;
-        s.CppNameOnly  = t.cppName;
-        s.SuperCppName = t.parent;
-        s.CppName      = std::string("struct ") + t.cppName;
-        if (t.parent[0] != '\0')
+        s.Name         = cppName;
+        s.FullName     = "ScriptStruct CoreUObject." + cppName;
+        s.CppNameOnly  = cppName;
+        s.SuperCppName = parent;
+        s.CppName      = "struct " + cppName;
+        if (!parent.empty())
         {
-            s.CppName += " : ";
-            s.CppName += t.parent;
-            auto pit = sizeOf.find(t.parent);
-            s.Inherited = pit != sizeOf.end() ? pit->second : 0;
+            s.CppName += " : " + parent;
+            s.Inherited = sizeOf[parent];
         }
         // FProperty's own fields may start at FField's data extent (FlagsPrivate+4),
         // below sizeof(FField): standard layouts pack ArrayDim there, in FField's tail
         // padding. sdkcoregen::PackBaseTailPadding ends FField's declaration at that
         // extent; a layout with ArrayDim at sizeof(FField) gets a leading pad instead.
-        if (std::string(t.cppName) == "FProperty")
+        if (cppName == "FProperty")
             s.Inherited = static_cast<uint32_t>(offs.FField.FlagsPrivate + sizeof(int32_t));
-        s.Size = sizeOf[t.cppName];
+        s.Size = size;
         // Members stays empty — augment() fills via fieldsFor() in next step.
 
         corePkg->Structures.push_back(std::move(s));
     }
+    return allocated;
 }
 
 // Settle each enum's underlying type against the members that store it. Runs over every
@@ -584,7 +645,7 @@ static void SettleEnumWidths(std::vector<UE_UPackage> &packages)
     });
 }
 
-void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressCallback &progressCallback)
+void UEDumper::BuildProcessedPackages(BufferFmt &logsBufferFmt, UEPackagesArray &packages, const ProgressCallback &progressCallback)
 {
     _sdkProcessed.clear();
     _sdkNameToPkg.clear();
@@ -678,7 +739,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
     // Synthesize FField / FProperty + subclasses into CoreUObject before augment.
     // These types aren't UObjects so the walker never produces them; we mint empty
     // Struct entries here and let augment() fill members from UE_Offsets.
-    SynthesizeReflectionTypes();
+    const auto allocated = SynthesizeReflectionTypes(logsBufferFmt, packages);
 
     // Augment core reflection classes (UObject/UField/UStruct/UEnum/UFunction/UClass):
     // stitch typed members back in over the opaque Pad_0xN[] regions the
@@ -781,18 +842,22 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                 add(offs.FProperty.PropertyFlags,   8, "uint64_t", "PropertyFlags");
                 add(offs.FProperty.Offset_Internal, 4, "int32_t",  "Offset_Internal");
             }
-            // FProperty subclasses — tail data lives at FProperty.SubPropertyBase.
+            // FProperty subclasses — each tail member at its own probed offset.
             else if (cppName == "FStructProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct UStruct*", "Struct", true);
+                add(offs.FStructProperty.Struct, 8, "struct UStruct*", "Struct", true);
             }
             else if (cppName == "FObjectPropertyBase")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "PropertyClass", true);
+                add(offs.FObjectPropertyBase.PropertyClass, 8, "struct UClass*", "PropertyClass", true);
             }
             else if (cppName == "FClassProperty")
             {
-                add(offs.FProperty.SubPropertyBase + sizeof(void *), 8, "struct UClass*", "MetaClass", true);
+                add(offs.FClassProperty.MetaClass, 8, "struct UClass*", "MetaClass", true);
+            }
+            else if (cppName == "FSoftClassProperty")
+            {
+                add(offs.FSoftClassProperty.MetaClass, 8, "struct UClass*", "MetaClass", true);
             }
             else if (cppName == "FArrayProperty")
             {
@@ -800,7 +865,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "FByteProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct UEnum*", "Enum", true);
+                add(offs.FByteProperty.Enum, 8, "struct UEnum*", "Enum", true);
             }
             else if (cppName == "FBoolProperty")
             {
@@ -816,37 +881,67 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             }
             else if (cppName == "FSetProperty")
             {
-                add(setElemOff, 8, "struct FProperty*", "ElementProp", true);
+                add(setElemOff,                   8,    "struct FProperty*",       "ElementProp", true);
+                add(setElemOff + sizeof(void *), 0x14, "struct FScriptSetLayout", "SetLayout",   true);
             }
             else if (cppName == "FMapProperty")
             {
-                add(mapKeyOff,   8, "struct FProperty*", "KeyProp",   true);
-                add(mapValueOff, 8, "struct FProperty*", "ValueProp", true);
+                add(mapKeyOff,                     8,    "struct FProperty*",       "KeyProp",   true);
+                add(mapValueOff,                   8,    "struct FProperty*",       "ValueProp", true);
+                add(mapValueOff + sizeof(void *), 0x18, "struct FScriptMapLayout", "MapLayout", true);
             }
             else if (cppName == "FInterfaceProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct UClass*", "InterfaceClass", true);
+                add(offs.FInterfaceProperty.InterfaceClass, 8, "struct UClass*", "InterfaceClass", true);
             }
             else if (cppName == "FFieldPathProperty")
             {
-                add(offs.FProperty.Size, fnameSize, "FName", "PropertyName", true);
+                add(offs.FFieldPathProperty.PropertyClass, 8, "struct FFieldClass*", "PropertyClass", true);
             }
             else if (cppName == "FDelegateProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct UFunction*", "SignatureFunction", true);
+                add(offs.FDelegateProperty.SignatureFunction, 8, "struct UFunction*", "SignatureFunction", true);
+            }
+            else if (cppName == "FMulticastDelegateProperty")
+            {
+                add(offs.FMulticastDelegateProperty.SignatureFunction, 8, "struct UFunction*", "SignatureFunction", true);
             }
             else if (cppName == "FOptionalProperty")
             {
-                add(offs.FProperty.SubPropertyBase, 8, "struct FProperty*", "ValueProperty", true);
+                add(offs.FOptionalProperty.ValueProperty, 8, "struct FProperty*", "ValueProperty", true);
             }
-            // FSoftClassProperty: no new fields beyond FClassProperty.
+            // FScriptSet::GetScriptLayout and FScriptMap::GetScriptLayout fill these.
+            else if (cppName == "FScriptSparseArrayLayout")
+            {
+                add(0x0, 4, "int32_t", "Alignment", true);
+                add(0x4, 4, "int32_t", "Size",      true);
+            }
+            else if (cppName == "FScriptSetLayout")
+            {
+                add(0x0, 4, "int32_t",                         "HashNextIdOffset",  true);
+                add(0x4, 4, "int32_t",                         "HashIndexOffset",   true);
+                add(0x8, 4, "int32_t",                         "Size",              true);
+                add(0xC, 8, "struct FScriptSparseArrayLayout", "SparseArrayLayout", true);
+            }
+            else if (cppName == "FScriptMapLayout")
+            {
+                add(0x0, 4,    "int32_t",                 "ValueOffset", true);
+                add(0x4, 0x14, "struct FScriptSetLayout", "SetLayout",   true);
+            }
+            // FSoftObjectProperty and the inline and sparse multicast delegate properties
+            // declare no members.
             return v;
         };
 
         auto augment = [&](UE_UPackage::Struct &s)
         {
+            // A synthesized type with a checked allocation size is padded out to it even
+            // when it declares no members of its own.
+            const auto allocation = allocated.find(s.CppNameOnly);
+            const bool checked = allocation != allocated.end();
+
             auto fields = fieldsFor(s.CppNameOnly);
-            if (fields.empty()) return;
+            if (fields.empty() && !checked) return;
 
             std::sort(fields.begin(), fields.end(),
                       [](const KnownField &a, const KnownField &b) { return a.Offset < b.Offset; });
@@ -859,7 +954,7 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
                                        || f.Offset + f.Size > s.Size;
                                }),
                 fields.end());
-            if (fields.empty()) return;
+            if (fields.empty() && !checked) return;
 
             std::vector<UE_UPackage::Member> rebuilt;
             rebuilt.reserve(fields.size() * 2 + 1);
@@ -907,10 +1002,18 @@ void UEDumper::BuildProcessedPackages(UEPackagesArray &packages, const ProgressC
             // computed for 0x8 — which silently shifts FProperty::Offset_Internal and breaks
             // reflection), the emitted C++ struct's sizeof diverges from the dumped size.
             // Emit a static_assert so that mismatch fails to COMPILE instead of resolving
-            // wrong offsets at runtime. Only for 8-aligned dumped sizes — pointer-bearing
-            // structs whose C++ sizeof equals the dumped size; non-aligned tails (FBoolProperty,
-            // FFieldPathProperty) round up under C++ alignment and would false-trip.
-            if (s.Size && (s.Size % 8 == 0))
+            // wrong offsets at runtime.
+            //
+            // A property subclass is checked against the size its ConstructFn allocates,
+            // which does not derive from UE_Offsets: a member placed past the end of the
+            // engine's object fails the build. Other types are checked against the dumped
+            // size, only when it is 8-aligned — pointer-bearing structs whose C++ sizeof
+            // equals it; the int32-only container layouts are 4-aligned.
+            if (checked)
+                s.Trailer = fmt::format(
+                    "static_assert(sizeof({0}) == 0x{1:X}, \"{0} differs from the size the engine allocates — re-dump SDK\");",
+                    s.CppNameOnly, allocation->second);
+            else if (s.Size && (s.Size % 8 == 0))
                 s.Trailer = fmt::format(
                     "static_assert(sizeof({}) == 0x{:X}, \"{} layout mismatch vs dumped size — re-dump SDK\");",
                     s.CppNameOnly, s.Size, s.CppNameOnly);
