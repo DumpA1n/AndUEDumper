@@ -353,8 +353,10 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     uint32_t offset = s.Inherited;
     auto lowerToOwnMember = [&](IProperty *prop)
     {
-        if (prop->GetSize() * prop->GetArrayDim() > 0)
-            offset = std::min(offset, static_cast<uint32_t>(prop->GetOffset()));
+        const int64_t memberSize = int64_t(prop->GetSize()) * prop->GetArrayDim();
+        const int64_t memberOffset = prop->GetOffset();
+        if (memberSize > 0 && memberOffset >= 0 && memberOffset + memberSize <= s.Size)
+            offset = std::min(offset, static_cast<uint32_t>(memberOffset));
     };
     for (auto prop = object.GetChildProperties().Cast<UE_FProperty>(); prop; prop = prop.GetNext().Cast<UE_FProperty>())
     {
@@ -374,6 +376,10 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
     auto generateMember = [&](IProperty *prop, Member *m) -> bool
     {
         auto arrDim = prop->GetArrayDim();
+        const int64_t memberSize = int64_t(prop->GetSize()) * arrDim;
+        const int64_t memberOffset = prop->GetOffset();
+        if (memberSize <= 0 || memberOffset < 0 || memberOffset + memberSize > s.Size)
+            return false;
         m->Size = prop->GetSize() * arrDim;
         if (m->Size == 0)
         {
