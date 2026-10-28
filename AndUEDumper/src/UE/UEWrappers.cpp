@@ -1549,5 +1549,5 @@ UE_FFieldClass UE_FFieldPathProperty::GetPropertyClass() const
 
 std::string UE_FFieldPathProperty::GetTypeStr() const
 {
-    return "struct TFieldPath<F" + GetPropertyClass().GetName() + ">";
+    return "struct TFieldPath<struct F" + GetPropertyClass().GetName() + ">";
 }
