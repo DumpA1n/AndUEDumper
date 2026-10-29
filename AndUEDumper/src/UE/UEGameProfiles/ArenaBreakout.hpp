@@ -117,6 +117,7 @@ public:
             offsets.UStruct.Children += sizeof(void *);
             offsets.UStruct.ChildProperties += sizeof(void *);
             offsets.UStruct.PropertiesSize += sizeof(void *);
+            offsets.UStruct.MinAlignment += sizeof(void *);
 
             offsets.UField.Next += sizeof(void *);
             offsets.UEnum.Names += sizeof(void *);

@@ -27,6 +27,8 @@ public:
         std::string Name;     // sanitized identifier (keyword-safe)
         uint64_t    Flags = 0; // CPF_* flags from prop->GetPropertyFlags()
         int32_t     ArrayDim = 1;
+        uint32_t    Offset = 0; // offset in the engine's parameter block
+        uint32_t    Size = 0;   // engine size, all array elements
     };
     struct Function
     {
@@ -39,6 +41,8 @@ public:
         std::string OwnerCppName;   // owner struct C++ name (qualifier in out-of-line bodies)
         std::string OwnerUEName;    // owner struct UE FName (passed to UClass::GetFunction)
         std::vector<Param> ParamsList;
+        uint32_t    ReturnOffset = 0; // offset of the ReturnValue in the parameter block
+        uint32_t    ReturnSize = 0;
         bool        IsStatic = false; // FUNC_Static
         uint32_t EFlags = 0;
         std::string Flags;
@@ -55,6 +59,10 @@ public:
         std::string SuperCppName;   // just "FBar" or empty
         uint32_t Inherited = 0;
         uint32_t Size = 0;
+        // The engine's alignment for the struct (UStruct::MinAlignment), 0 when unknown.
+        // Emitted as __attribute__((aligned)): members the dump cannot type are declared as
+        // byte arrays, which leave the C++ alignment below the engine's.
+        uint32_t Alignment = 0;
         std::vector<Member> Members;
         std::vector<Function> Functions;
         // other dumped types needed as complete type (inheritance, value members)

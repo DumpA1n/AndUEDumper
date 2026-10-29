@@ -120,9 +120,15 @@ bool UEDumper::Dump(std::unordered_map<std::string, BufferFmt> *outBuffersMap)
 
     BuildProcessedPackages(logsBufferFmt, packages, _dumpProgressCallback);
 
+    const std::vector<UE_UPackage::Struct *> dumpedStructs = CollectStructs(_sdkProcessed);
+    size_t alignedStructs = 0;
+    for (const auto *s : dumpedStructs)
+        alignedStructs += s->Alignment != 0;
+    logsBufferFmt.append("SDK struct alignment: {} of {} structs read from MinAlignment\n",
+                         alignedStructs, dumpedStructs.size());
+
     // Rewrites declarations, so it precedes every header, AIOHeader.hpp included.
-    const sdkcoregen::TailPaddingStats tailStats =
-        sdkcoregen::PackBaseTailPadding(CollectStructs(_sdkProcessed));
+    const sdkcoregen::TailPaddingStats tailStats = sdkcoregen::PackBaseTailPadding(dumpedStructs);
     logsBufferFmt.append(
         "SDK base tail padding: {} bases reused ({} roots marked, {} emptied); {} unresolved\n",
         tailStats.ReusedBases, tailStats.MarkedRoots, tailStats.EmptiedBases, tailStats.UnresolvedBases);
@@ -1581,19 +1587,65 @@ static void EmitUFunctionBody(BufferFmt &buf,
                    f.OwnerUEName, f.Name);
     }
 
-    // Parms struct: param order matches UE reflection, ReturnValue last
-    buf.append("    struct\n    {{\n");
+    // Parms struct: every parameter at its engine offset, gaps and the tail up to ParmsSize
+    // as explicit padding, as struct members are laid out. The declared types alone do not
+    // reproduce the engine's offsets: an enum declared narrower than its storage or a type
+    // the SDK declares as bytes moves every parameter after it.
+    struct Slot
+    {
+        uint32_t Offset, Size;
+        std::string Decl;
+    };
+    // The bytes the declaration occupies: an enum takes its declared underlying width,
+    // which may be narrower than the property's storage; other types the engine size.
+    auto declaredSize = [&](const std::string &type, uint32_t engineSize, int32_t arrayDim) -> uint32_t
+    {
+        static const std::unordered_map<std::string, uint32_t> kWidths = {
+            {"uint8_t", 1}, {"uint16_t", 2}, {"uint32_t", 4}, {"uint64_t", 8},
+            {"int8_t", 1}, {"int16_t", 2}, {"int32_t", 4}, {"int64_t", 8}};
+        const auto e = enumUnderlying.find(type);
+        const auto w = e != enumUnderlying.end() ? kWidths.find(e->second) : kWidths.end();
+        return w != kWidths.end() ? w->second * static_cast<uint32_t>(std::max(arrayDim, 1)) : engineSize;
+    };
+    std::vector<Slot> slots;
     for (const auto &p : f.ParamsList)
     {
         const std::string fieldType = qualifyType(p.Type);
-        if (p.ArrayDim > 1)
-            buf.append("        {} {}[0x{:X}];\n", fieldType, p.Name, p.ArrayDim);
-        else
-            buf.append("        {} {};\n", fieldType, p.Name);
+        slots.push_back({p.Offset, declaredSize(p.Type, p.Size, p.ArrayDim),
+                         p.ArrayDim > 1 ? fmt::format("{} {}[0x{:X}]", fieldType, p.Name, p.ArrayDim)
+                                        : fmt::format("{} {}", fieldType, p.Name)});
     }
     if (hasReturn)
-        buf.append("        {} ReturnValue;\n", qualifyType(f.ReturnType));
+        slots.push_back({f.ReturnOffset, declaredSize(f.ReturnType, f.ReturnSize, 1),
+                         fmt::format("{} ReturnValue", qualifyType(f.ReturnType))});
+    std::stable_sort(slots.begin(), slots.end(), [](const Slot &a, const Slot &b) { return a.Offset < b.Offset; });
+
+    buf.append("    struct\n    {{\n");
+    uint32_t cursor = 0;
+    for (const auto &s : slots)
+    {
+        if (s.Offset > cursor)
+            buf.append("        uint8_t Pad_0x{:X}[0x{:X}];\n", cursor, s.Offset - cursor);
+        buf.append("        {};\n", s.Decl);
+        cursor = std::max(cursor, s.Offset + s.Size);
+    }
+    if (!slots.empty() && static_cast<uint32_t>(f.ParamSize) > cursor)
+        buf.append("        uint8_t Pad_0x{:X}[0x{:X}];\n", cursor, f.ParamSize - cursor);
     buf.append("    }} Parms{{}};\n");
+
+    // ProcessEvent hands the native function the engine's parameter offsets, and the
+    // native writes the return value through the return slot before reading it back, so
+    // a block declared shorter or skewed is read and written past its end. A declared type
+    // wider than the engine's storage still fails here.
+    for (const auto &p : f.ParamsList)
+        buf.append("    static_assert(offsetof(decltype(Parms), {}) == 0x{:X}, \"{}::{} parameter '{}' is not at its dumped offset — re-dump SDK\");\n",
+                   p.Name, p.Offset, f.OwnerCppName, f.CppNameOnly, p.Name);
+    if (hasReturn)
+        buf.append("    static_assert(offsetof(decltype(Parms), ReturnValue) == 0x{:X}, \"{}::{} ReturnValue is not at its dumped offset — re-dump SDK\");\n",
+                   f.ReturnOffset, f.OwnerCppName, f.CppNameOnly);
+    if (hasReturn || !f.ParamsList.empty())
+        buf.append("    static_assert(sizeof(Parms) == (0x{:X} + alignof(decltype(Parms)) - 1) / alignof(decltype(Parms)) * alignof(decltype(Parms)), \"{}::{} parameter block size mismatch vs dumped ParmsSize — re-dump SDK\");\n",
+                   f.ParamSize, f.OwnerCppName, f.CppNameOnly);
 
     // fill in-params; pure out-params stay default-constructed.
     // C-cast strips ConstParm const so refs bind to non-const Parms field.

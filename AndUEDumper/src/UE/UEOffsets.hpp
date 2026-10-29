@@ -97,6 +97,7 @@ struct UE_Offsets
         uintptr_t Children = 0;
         uintptr_t ChildProperties = 0;
         uintptr_t PropertiesSize = 0;
+        uintptr_t MinAlignment = 0;  // 0: unknown
     } UStruct;
     struct
     {

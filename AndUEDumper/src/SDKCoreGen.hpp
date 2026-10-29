@@ -711,8 +711,11 @@ public:
 //   * its declared members end at or before the lowest offset any derived struct uses, so
 //     the generated trailing padding is shortened or dropped.
 //   * its sizeof still equals the dumped Size. With the explicit trailing padding gone,
-//     __attribute__((aligned(N))) restores it. Unlike alignas, the attribute may request
-//     less than the natural alignment, which is then kept.
+//     __attribute__((aligned(N))) restores it. N is the engine's alignment when that
+//     rounds the declared data up to Size, otherwise the smallest power of two that does;
+//     it replaces the struct's Alignment, which AppendStructsToBuffer emits. Unlike
+//     alignas, the attribute may request less than the natural alignment, which is then
+//     kept.
 //
 // A base left with no members is an empty class instead: the empty-base optimization puts
 // derived members at offset 0, which needs no marker and no attribute.
@@ -799,7 +802,6 @@ TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
     // at. start[i] is that offset for struct i itself — its lowest member, or, for a struct
     // without members, the limit it passes on from its own derived structs.
     std::vector<uint32_t> start(n);
-    std::vector<uint32_t> align(n, 0);
     std::vector<bool> marked(n, false);
     for (size_t i : order)
     {
@@ -833,9 +835,13 @@ TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
             else if (fits)
             {
                 const uint32_t end = dataEnd(kept);
-                for (alignment = 1; alignment <= s.Size; alignment *= 2)
-                    if ((end + alignment - 1) / alignment * alignment == s.Size)
-                        break;
+                auto restores = [&](uint32_t a) { return (end + a - 1) / a * a == s.Size; };
+                if (s.Alignment && restores(s.Alignment))
+                    alignment = s.Alignment;
+                else
+                    for (alignment = 1; alignment <= s.Size; alignment *= 2)
+                        if (restores(alignment))
+                            break;
                 fits = alignment <= s.Size;
             }
 
@@ -846,10 +852,15 @@ TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
                     ++stats.ReusedBases;
                 s.Members = std::move(kept);
                 if (s.Members.empty())
+                {
                     stats.EmptiedBases += !hasBase;
+                    // An aligned empty class is no longer 1 byte; derived structs carry
+                    // the alignment through their own attribute.
+                    s.Alignment = 0;
+                }
                 else
                 {
-                    align[i] = alignment;
+                    s.Alignment = alignment;
                     marked[i] = !hasBase;
                     stats.MarkedRoots += marked[i];
                 }
@@ -892,9 +903,6 @@ TailPaddingStats PackBaseTailPadding(const std::vector<StructT*>& structs)
         else
             dataSize[i] = s.Size;  // C++03-POD: derived structs start past its sizeof
 
-        const std::string head = "struct ";
-        if (align[i] > 1 && s.CppName.compare(0, head.size(), head) == 0)
-            s.CppName.insert(head.size(), "__attribute__((aligned(" + std::to_string(align[i]) + "))) ");
         if (marked[i])
             s.CppName += " : TTailPaddingReusable<" + s.CppNameOnly + ">";
     }
@@ -1178,6 +1186,13 @@ LayoutGuardStats AppendLayoutGuards(const std::vector<StructT*>& structs)
             guards += "static_assert(sizeof(" + s.CppNameOnly + ") == (" + hx(s.Size) + " + " + align + " - 1) / " +
                       align + " * " + align + ", \"" + s.CppNameOnly + " size mismatch vs dumped size — re-dump SDK\");\n";
         }
+        // sizeof, and with it the stride of a TArray of the struct, is rounded to the
+        // alignment. The aligned attribute cannot lower the natural alignment, so a member
+        // declared with a wider type than the engine's fails here even where every offset
+        // agrees.
+        if (s.Alignment)
+            guards += "static_assert(alignof(" + s.CppNameOnly + ") == " + hx(s.Alignment) + ", \"" + s.CppNameOnly +
+                      " alignment mismatch vs dumped alignment — re-dump SDK\");\n";
 
         for (const auto& m : s.Members)
         {

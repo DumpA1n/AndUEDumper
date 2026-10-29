@@ -469,6 +469,7 @@ public:
     UE_FField GetChildProperties() const;
     UE_UField GetChildren() const;
     int32_t GetSize() const;
+    int32_t GetMinAlignment() const;
     static UE_UClass StaticClass();
 
     UE_FField FindChildProp(const std::string &name) const;

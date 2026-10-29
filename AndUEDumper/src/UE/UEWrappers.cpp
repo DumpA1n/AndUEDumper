@@ -506,6 +506,12 @@ int32_t UE_UStruct::GetSize() const
     return vm_rpm_ptr<int32_t>(object + UEWrappers::GetOffsets()->UStruct.PropertiesSize);
 }
 
+int32_t UE_UStruct::GetMinAlignment() const
+{
+    const uintptr_t offset = UEWrappers::GetOffsets()->UStruct.MinAlignment;
+    return offset ? vm_rpm_ptr<int32_t>(object + offset) : 0;
+}
+
 UE_UClass UE_UStruct::StaticClass()
 {
     static auto obj = UEWrappers::GetObjects()->FindObject<UE_UClass>("Class CoreUObject.Struct");

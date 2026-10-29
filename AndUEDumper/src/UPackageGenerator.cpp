@@ -245,6 +245,8 @@ bool UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
                 return;
             }
             out->ReturnType = std::move(*type);
+            out->ReturnOffset = static_cast<uint32_t>(prop->GetOffset());
+            out->ReturnSize = static_cast<uint32_t>(prop->GetSize() * prop->GetArrayDim());
         }
         // if property has 'Parm' flag
         else if (flags & CPF_Parm)
@@ -265,6 +267,8 @@ bool UE_UPackage::GenerateFunction(const UE_UFunction &fn, Function *out)
             p.Name = nameStr;
             p.Flags = flags;
             p.ArrayDim = arrDim;
+            p.Offset = static_cast<uint32_t>(prop->GetOffset());
+            p.Size = static_cast<uint32_t>(prop->GetSize() * arrDim);
             out->ParamsList.push_back(std::move(p));
 
             if (arrDim > 1)
@@ -334,6 +338,12 @@ void UE_UPackage::GenerateStruct(const UE_UStruct &object, std::vector<Struct> &
         arr.push_back(s);
         return;
     }
+
+    // A power of two no larger than any alignment UE declares; anything else was not read
+    // from a MinAlignment field and stays unknown.
+    const int32_t alignment = object.GetMinAlignment();
+    if (alignment > 0 && alignment <= 64 && (alignment & (alignment - 1)) == 0)
+        s.Alignment = static_cast<uint32_t>(alignment);
 
     auto super = object.GetSuper();
     if (super)
@@ -605,8 +615,12 @@ void UE_UPackage::AppendStructsToBuffer(std::vector<Struct> &arr, BufferFmt *pBu
 
     for (auto &s : arr)
     {
+        std::string head = s.CppName;
+        const std::string keyword = "struct ";
+        if (s.Alignment > 1 && head.compare(0, keyword.size(), keyword) == 0)
+            head.insert(keyword.size(), fmt::format("__attribute__((aligned({}))) ", s.Alignment));
         pBufFmt->append("// Object: {}\n// Size: 0x{:X} (Inherited: 0x{:X})\n{}\n{{",
-                        s.FullName, s.Size, s.Inherited, s.CppName);
+                        s.FullName, s.Size, s.Inherited, head);
 
         // emit segments with single blank between, regardless of which exist
         std::vector<std::string> segs;

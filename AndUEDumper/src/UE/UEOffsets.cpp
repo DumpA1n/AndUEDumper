@@ -137,6 +137,7 @@ std::string UE_Offsets::ToString() const
             kOUT_NS_MEMBER_P(UStruct, Children);
             kOUT_NS_MEMBER_P(UStruct, ChildProperties);
             kOUT_NS_MEMBER_P(UStruct, PropertiesSize);
+            kOUT_NS_MEMBER_P(UStruct, MinAlignment);
             kOUT_NS_END();
             kOUT_NEWLINE();
             kOUT_NEWLINE();
@@ -415,6 +416,7 @@ namespace UE_DefaultOffsets
             offsets.UStruct.SuperStruct = offsets.UField.Next + sizeof(void *);       // sizeof(UField)
             offsets.UStruct.Children = offsets.UStruct.SuperStruct + sizeof(void *);  // UField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.Children + sizeof(void *);
+            offsets.UStruct.MinAlignment = offsets.UStruct.PropertiesSize + sizeof(int32_t);
 
             // UFunction.EFunctionFlags = sizeof(UStruct)
             offsets.UFunction.EFunctionFlags = offsets.UStruct.PropertiesSize + (sizeof(int32_t) * 2) + ((sizeof(void *) + sizeof(int32_t) * 2) * 2) + (sizeof(void *) * 4);
@@ -489,6 +491,7 @@ namespace UE_DefaultOffsets
             offsets.UStruct.SuperStruct = offsets.UField.Next + (sizeof(void *) * 3);  // sizeof(UField) + sizeof(FStructBaseChain)
             offsets.UStruct.Children = offsets.UStruct.SuperStruct + sizeof(void *);   // UField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.Children + sizeof(void *);
+            offsets.UStruct.MinAlignment = offsets.UStruct.PropertiesSize + sizeof(int32_t);
 
             offsets.UFunction.EFunctionFlags = offsets.UStruct.PropertiesSize + (sizeof(int32_t) * 2) + ((sizeof(void *) + sizeof(int32_t) * 2) * 2) + (sizeof(void *) * 4);
             offsets.UFunction.NumParams = offsets.UFunction.EFunctionFlags + sizeof(int32_t);
@@ -573,6 +576,7 @@ namespace UE_DefaultOffsets
             offsets.UStruct.SuperStruct = offsets.UField.Next + (sizeof(void *) * 3);  // sizeof(UField) + sizeof(FStructBaseChain)
             offsets.UStruct.Children = offsets.UStruct.SuperStruct + sizeof(void *);   // UField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.Children + sizeof(void *);
+            offsets.UStruct.MinAlignment = offsets.UStruct.PropertiesSize + sizeof(int32_t);
 
             offsets.UFunction.EFunctionFlags = offsets.UStruct.PropertiesSize + (sizeof(int32_t) * 2) + ((sizeof(void *) + sizeof(int32_t) * 2) * 2) + (sizeof(void *) * 4);
             offsets.UFunction.NumParams = offsets.UFunction.EFunctionFlags + sizeof(int32_t);
@@ -598,6 +602,7 @@ namespace UE_DefaultOffsets
 
             offsets.UStruct.ChildProperties = offsets.UStruct.Children + sizeof(void *);  // FField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.ChildProperties + sizeof(void *);
+            offsets.UStruct.MinAlignment = offsets.UStruct.PropertiesSize + sizeof(int32_t);
 
             offsets.UClass.CastFlags = 0xD8;
             offsets.UClass.DefaultObject = 0x138;
@@ -722,6 +727,7 @@ namespace UE_DefaultOffsets
             offsets.UStruct.Children = offsets.UStruct.SuperStruct + sizeof(void *);      // UField*
             offsets.UStruct.ChildProperties = offsets.UStruct.Children + sizeof(void *);  // FField*
             offsets.UStruct.PropertiesSize = offsets.UStruct.ChildProperties + sizeof(void *);
+            offsets.UStruct.MinAlignment = offsets.UStruct.PropertiesSize + sizeof(int32_t);
 
             offsets.UClass.CastFlags = 0xD8;
             offsets.UClass.DefaultObject = 0x138;
