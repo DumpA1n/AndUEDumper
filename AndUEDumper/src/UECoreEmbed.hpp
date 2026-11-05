@@ -5,14 +5,23 @@ static const char* kUECoreUEAssertH = R"UEASSERT(#pragma once
 #include <cstdint>
 #include <cstdio>
 
-#if defined(__ANDROID__)
-	#include <android/log.h>
-	#ifndef UE_ASSERT_LOG_TAG
-		#define UE_ASSERT_LOG_TAG "INJECT"
+// A consumer routes assertion messages through its own sink by defining
+// UE_ASSERT_LOG(fmt, ...) as a printf-style call, either before including the
+// SDK or in the header named by UE_ASSERT_LOG_INCLUDE. Otherwise they go to
+// liblog on Android and to stderr elsewhere.
+#ifdef UE_ASSERT_LOG_INCLUDE
+	#include UE_ASSERT_LOG_INCLUDE
+#endif
+#ifndef UE_ASSERT_LOG
+	#if defined(__ANDROID__)
+		#include <android/log.h>
+		#ifndef UE_ASSERT_LOG_TAG
+			#define UE_ASSERT_LOG_TAG "INJECT"
+		#endif
+		#define UE_ASSERT_LOG(...) __android_log_print(ANDROID_LOG_FATAL, UE_ASSERT_LOG_TAG, __VA_ARGS__)
+	#else
+		#define UE_ASSERT_LOG(...) (std::fprintf(stderr, __VA_ARGS__), std::fprintf(stderr, "\n"))
 	#endif
-	#define UE_ASSERT_LOG(...) __android_log_print(ANDROID_LOG_FATAL, UE_ASSERT_LOG_TAG, __VA_ARGS__)
-#else
-	#define UE_ASSERT_LOG(...) (std::fprintf(stderr, __VA_ARGS__), std::fprintf(stderr, "\n"))
 #endif
 
 #if defined(__FILE_NAME__)
